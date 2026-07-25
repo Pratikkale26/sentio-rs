@@ -12,6 +12,13 @@ pub fn calc_fee(ctx: Context<CalcFee>, amount: u64) -> Result<u64> {
     Ok(fee)
 }
 
+/// Safe: divisor is a non-zero compile-time const (incl. cast).
+pub const ROOT_RING_SIZE: usize = 30;
+
+pub fn advance_root_ring(head: u32) -> u32 {
+    (head + 1) % ROOT_RING_SIZE as u32
+}
+
 #[account]
 pub struct Config {
     pub rate: u64,
