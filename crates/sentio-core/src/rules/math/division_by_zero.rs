@@ -135,8 +135,9 @@ fn is_safe_divisor(expr: &Expr, nonzero_consts: &HashSet<String>) -> bool {
         Expr::Group(g) => is_safe_divisor(&g.expr, nonzero_consts),
         Expr::Cast(c) => is_safe_divisor(&c.expr, nonzero_consts),
         Expr::Reference(r) => is_safe_divisor(&r.expr, nonzero_consts),
-        Expr::Path(p) => path_last_ident(&p.path)
-            .is_some_and(|name| nonzero_consts.contains(&name)),
+        Expr::Path(p) => {
+            path_last_ident(&p.path).is_some_and(|name| nonzero_consts.contains(&name))
+        }
         _ => false,
     }
 }
@@ -189,65 +190,55 @@ mod tests {
 
     #[test]
     fn flags_division_by_variable_divisor() {
-        let findings = run(
-            r#"
+        let findings = run(r#"
             pub fn calc_fee(amount: u64, rate: u64) -> u64 {
                 amount / rate
             }
-            "#,
-        );
+            "#);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "SW024");
     }
 
     #[test]
     fn flags_division_by_account_field() {
-        let findings = run(
-            r#"
+        let findings = run(r#"
             pub fn calc(ctx: Context<Foo>, amount: u64) -> u64 {
                 amount / ctx.accounts.config.rate
             }
-            "#,
-        );
+            "#);
         assert_eq!(findings.len(), 1);
     }
 
     #[test]
     fn does_not_flag_literal_divisor() {
-        let findings = run(
-            r#"
+        let findings = run(r#"
             pub fn calc(amount: u64) -> u64 {
                 amount / 100
             }
-            "#,
-        );
+            "#);
         assert!(findings.is_empty());
     }
 
     #[test]
     fn does_not_flag_checked_div() {
-        let findings = run(
-            r#"
+        let findings = run(r#"
             pub fn calc(amount: u64, rate: u64) -> Option<u64> {
                 amount.checked_div(rate)
             }
-            "#,
-        );
+            "#);
         assert!(findings.is_empty());
     }
 
     #[test]
     fn does_not_flag_nonzero_const_divisor() {
         // FP from privacy/ZK codebase: ring buffer index with const size.
-        let findings = run(
-            r#"
+        let findings = run(r#"
             pub const ROOT_RING_SIZE: usize = 30;
 
             pub fn advance(head: u32) -> u32 {
                 (head + 1) % ROOT_RING_SIZE as u32
             }
-            "#,
-        );
+            "#);
         assert!(
             findings.is_empty(),
             "nonzero const as divisor must be safe: {findings:?}"
@@ -256,39 +247,33 @@ mod tests {
 
     #[test]
     fn does_not_flag_bare_const_name_divisor() {
-        let findings = run(
-            r#"
+        let findings = run(r#"
             const SCALE: u64 = 100;
             pub fn pct(amount: u64) -> u64 {
                 amount / SCALE
             }
-            "#,
-        );
+            "#);
         assert!(findings.is_empty());
     }
 
     #[test]
     fn flags_zero_const_divisor() {
-        let findings = run(
-            r#"
+        let findings = run(r#"
             const ZERO: u64 = 0;
             pub fn bad(amount: u64) -> u64 {
                 amount / ZERO
             }
-            "#,
-        );
+            "#);
         assert_eq!(findings.len(), 1);
     }
 
     #[test]
     fn flags_literal_zero_divisor() {
-        let findings = run(
-            r#"
+        let findings = run(r#"
             pub fn bad(amount: u64) -> u64 {
                 amount / 0
             }
-            "#,
-        );
+            "#);
         assert_eq!(findings.len(), 1);
     }
 }
