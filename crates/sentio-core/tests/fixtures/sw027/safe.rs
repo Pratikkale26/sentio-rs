@@ -13,6 +13,13 @@ pub fn update_vault(ctx: Context<UpdateVault>, new_value: u64) -> Result<()> {
     Ok(())
 }
 
+/// Safe: structured program log as observability (no Anchor emit!).
+pub fn init_vault(ctx: Context<UpdateVault>) -> Result<()> {
+    ctx.accounts.vault.value = 0;
+    msg!("conf-vault-init:{}", ctx.accounts.vault.key());
+    Ok(())
+}
+
 #[event]
 pub struct VaultUpdated {
     pub value: u64,

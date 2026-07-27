@@ -13,12 +13,13 @@ impl Rule for MissingStateChangeEventRule {
             title: "Missing event emission on state change",
             severity: RuleSeverity::Low,
             description: "Detects instruction handlers that write to account state but never \
-                          call emit!() to log a structured event. Without events, off-chain \
-                          indexers, dashboards, and audit trails cannot observe state transitions, \
-                          making incidents harder to detect and investigate.",
-            fix_guidance: "Add emit!(MyEvent { field: value, ... }) after significant state \
-                           changes. Define event structs with #[event] and include the accounts \
-                           and values involved in the change.",
+                          call emit!()/emit_cpi!() or msg!() to expose the change. Without \
+                          events or program logs, off-chain indexers and audit trails cannot \
+                          observe state transitions. (Sentio is AST-based: it does not model \
+                          ZK proofs or external indexers.)",
+            fix_guidance: "Add emit!(MyEvent { ... }) after significant state changes, or a \
+                           structured msg!(\"...\") log that indexers can parse (common outside \
+                           Anchor event style).",
         };
         &METADATA
     }
@@ -39,19 +40,25 @@ impl Rule for MissingStateChangeEventRule {
                 continue;
             }
 
-            // Check if emit!() appears anywhere in the function body.
+            // Observability sinks: Anchor events or program logs (msg!) that many
+            // Solana programs / indexers use instead of emit!.
             let start = function.span.start_line.saturating_sub(1);
             let end = function.span.end_line.min(source_lines.len());
-            let has_emit = source_lines[start..end]
-                .iter()
-                .any(|line| line.contains("emit!") || line.contains("emit_cpi!"));
+            let has_observability = source_lines[start..end].iter().any(|line| {
+                let t = line.trim_start();
+                // Ignore commented-out sinks.
+                if t.starts_with("//") {
+                    return false;
+                }
+                line.contains("emit!") || line.contains("emit_cpi!") || line.contains("msg!")
+            });
 
-            if !has_emit {
+            if !has_observability {
                 findings.push(RuleMatch {
                     rule_id: "SW027",
                     severity: RuleSeverity::Low,
                     message: format!(
-                        "Function `{}` writes to account state but emits no event; \
+                        "Function `{}` writes to account state but has no emit!() or msg!(); \
                          off-chain observers cannot track this state change.",
                         function.name
                     ),
@@ -61,8 +68,8 @@ impl Rule for MissingStateChangeEventRule {
                         column: 1,
                     },
                     help: Some(
-                        "Add emit!(MyEvent { ... }) after state changes so indexers and \
-                         dashboards can observe transitions."
+                        "Add emit!(MyEvent { ... }) or a structured msg!(\"...\") after state \
+                         changes so indexers and dashboards can observe transitions."
                             .to_string(),
                     ),
                 });
@@ -150,5 +157,31 @@ mod tests {
             },
         );
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_when_msg_present() {
+        // FP: many programs (incl. SPL-style) use structured msg! for indexers.
+        let file = parse_file(
+            r#"
+            use anchor_lang::prelude::*;
+            pub fn init_vault(ctx: Context<InitVault>) -> Result<()> {
+                ctx.accounts.vault.bump = ctx.bumps.vault;
+                msg!("conf-vault-init:{}", ctx.accounts.vault.key());
+                Ok(())
+            }
+            "#,
+        );
+        let rule = MissingStateChangeEventRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert!(
+            findings.is_empty(),
+            "msg! should count as observability: {findings:?}"
+        );
     }
 }
