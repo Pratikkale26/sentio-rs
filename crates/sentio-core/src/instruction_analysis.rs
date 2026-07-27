@@ -525,12 +525,14 @@ fn extract_account_name_from_str(s: &str) -> Option<String> {
     }
 }
 
-/// How an Accounts field is used in instruction bodies in this file.
+/// How an Accounts field is used in instruction bodies (and seeds attrs) in this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AccountFieldUsage {
     /// Occurrences of `ctx.accounts.<field>.key()` (pubkey read only).
     pub key_reads: usize,
-    /// Any other use (CPI, data/lamports/owner, bare pass-through, etc.).
+    /// Field appears in a `seeds = [...]` constraint (PDA seed input only).
+    pub seed_uses: usize,
+    /// Any other use (data/lamports/owner, CPI program, etc.).
     pub other_uses: usize,
 }
 
@@ -538,11 +540,22 @@ impl AccountFieldUsage {
     /// True when the field is only read as a pubkey (typical "store admin key" pattern).
     /// Requires at least one `.key()` so unused fields are not silently suppressed.
     pub fn is_pubkey_only(&self) -> bool {
-        self.key_reads > 0 && self.other_uses == 0
+        self.key_reads > 0 && self.other_uses == 0 && self.seed_uses == 0
+    }
+
+    /// True when the account is only used as identity material: `.key()` and/or PDA
+    /// seed input — never as data/owner/lamports. Applies even if the account is `mut`
+    /// (common for payout destinations that only pass `.key()` into state or seeds).
+    ///
+    /// Does **not** model ZK proofs, Groth16 public inputs, or cross-program checks —
+    /// those are invisible to AST analysis.
+    pub fn is_identity_only(&self) -> bool {
+        self.other_uses == 0 && (self.key_reads > 0 || self.seed_uses > 0)
     }
 }
 
-/// Analyze how `field_name` is used under `*.accounts.<field>` in this file's function bodies.
+/// Analyze how `field_name` is used under `*.accounts.<field>` in this file's function bodies,
+/// plus references inside `seeds = [...]` constraints on Accounts structs.
 ///
 /// Used to suppress SW001/SW002 when an AccountInfo is only a stored pubkey source
 /// (e.g. `amm.admin = ctx.accounts.admin.key()`), not a data/CPI/signer authority.
@@ -552,7 +565,59 @@ pub fn analyze_account_field_usage(file: &syn::File, field_name: &str) -> Accoun
         usage: AccountFieldUsage::default(),
     };
     visitor.visit_file(file);
+    visitor.usage.seed_uses += count_seed_constraint_refs(file, field_name);
     visitor.usage
+}
+
+fn count_seed_constraint_refs(file: &syn::File, field_name: &str) -> usize {
+    let mut count = 0usize;
+    count_seed_refs_in_items(&file.items, field_name, &mut count);
+    count
+}
+
+fn count_seed_refs_in_items(items: &[syn::Item], field_name: &str, count: &mut usize) {
+    for item in items {
+        match item {
+            syn::Item::Struct(s) => {
+                for field in &s.fields {
+                    for attr in &field.attrs {
+                        if !attr.path().is_ident("account") {
+                            continue;
+                        }
+                        let Ok(meta_list) = attr.meta.require_list() else {
+                            continue;
+                        };
+                        let tokens = meta_list.tokens.to_string();
+                        // Rough but effective: seeds = [ ..., field.key() ... ]
+                        let compact: String =
+                            tokens.chars().filter(|c| !c.is_whitespace()).collect();
+                        let lower = compact.to_ascii_lowercase();
+                        if !lower.contains("seeds=") && !lower.contains("seeds=[") {
+                            // still may be `seeds =` with spaces already stripped → seeds=
+                            if !compact.contains("seeds") {
+                                continue;
+                            }
+                        }
+                        if compact.contains(&format!("{field_name}.key"))
+                            || compact.contains(&format!("{field_name})"))
+                                && compact.contains("seeds")
+                        {
+                            // Prefer explicit .key() on the field name as seed input.
+                            if compact.contains(&format!("{field_name}.key")) {
+                                *count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, nested)) = &m.content {
+                    count_seed_refs_in_items(nested, field_name, count);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 struct AccountFieldUsageVisitor<'a> {

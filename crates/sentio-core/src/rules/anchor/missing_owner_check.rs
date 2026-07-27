@@ -13,8 +13,8 @@ impl Rule for MissingOwnerCheckRule {
             id: "SW002",
             title: "Missing owner check",
             severity: RuleSeverity::Critical,
-            description: "Detects AccountInfo or UncheckedAccount fields with no owner or address constraint and no owner guard in instruction logic, allowing an attacker to pass an account owned by any program.",
-            fix_guidance: "Add an owner constraint (#[account(owner = expected_program::ID)]) or an address constraint, or validate account.owner in your instruction handler.",
+            description: "Detects AccountInfo or UncheckedAccount fields with no owner or address constraint and no owner guard in instruction logic, allowing an attacker to pass an account owned by any program. Skips fields used only as pubkey/seed identity. Does not model ZK proofs or checks in other programs (AST limitation).",
+            fix_guidance: "Add an owner constraint (#[account(owner = expected_program::ID)]) or an address constraint, or validate account.owner in your instruction handler. If integrity is intentional via ZK public inputs or another program, document with /// CHECK: and use // sentio-ignore SW002 or a baseline — Sentio cannot verify that.",
         };
         &METADATA
     }
@@ -69,11 +69,10 @@ impl Rule for MissingOwnerCheckRule {
                     continue;
                 }
 
-                // Stored-pubkey only: only `.key()` is read (e.g. copy admin into state).
-                // Owner of that account is irrelevant — any pubkey may be passed by design.
-                if !c.is_mut
-                    && analyze_account_field_usage(&file.syntax, &field_name).is_pubkey_only()
-                {
+                // Identity-only: `.key()` and/or PDA seed input — never data/owner/lamports.
+                // Applies even when `mut` (payout keys copied into state / seeds).
+                // Does NOT skip "trust me, ZK / other program validates" without usage proof.
+                if analyze_account_field_usage(&file.syntax, &field_name).is_identity_only() {
                     continue;
                 }
 
@@ -335,6 +334,130 @@ mod tests {
         assert!(
             findings.is_empty(),
             "custom .owner == must not be SW002: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_mut_pubkey_only_identity() {
+        let file = parse_file(
+            r#"
+            use anchor_lang::prelude::*;
+
+            #[derive(Accounts)]
+            pub struct Init<'info> {
+                #[account(init, payer = payer, space = 8 + 32)]
+                pub config: Account<'info, Config>,
+                /// CHECK: pubkey stored in config only
+                #[account(mut)]
+                pub recipient: UncheckedAccount<'info>,
+                #[account(mut)]
+                pub payer: Signer<'info>,
+                pub system_program: Program<'info, System>,
+            }
+
+            pub fn init(ctx: Context<Init>) -> Result<()> {
+                ctx.accounts.config.recipient = ctx.accounts.recipient.key();
+                Ok(())
+            }
+
+            #[account]
+            pub struct Config {
+                pub recipient: Pubkey,
+            }
+        "#,
+        );
+
+        let rule = MissingOwnerCheckRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert!(
+            findings.is_empty(),
+            "mut identity-only must not be SW002: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_seed_only_account() {
+        let file = parse_file(
+            r#"
+            use anchor_lang::prelude::*;
+
+            #[derive(Accounts)]
+            pub struct CreatePda<'info> {
+                /// CHECK: only used as PDA seed
+                pub to_owner: UncheckedAccount<'info>,
+                #[account(
+                    init,
+                    payer = payer,
+                    space = 8,
+                    seeds = [b"pos", to_owner.key().as_ref()],
+                    bump
+                )]
+                pub position: Account<'info, Position>,
+                #[account(mut)]
+                pub payer: Signer<'info>,
+                pub system_program: Program<'info, System>,
+            }
+
+            pub fn create(ctx: Context<CreatePda>) -> Result<()> {
+                Ok(())
+            }
+
+            #[account]
+            pub struct Position {}
+        "#,
+        );
+
+        let rule = MissingOwnerCheckRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert!(
+            findings.is_empty(),
+            "seed-only UncheckedAccount must not be SW002: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn still_flags_mut_data_use_without_owner() {
+        // ZK-bound recipient that is actually read as data still needs a visible check
+        // for SW002 — proof binding is out of scope for AST.
+        let file = parse_file(
+            r#"
+            use anchor_lang::prelude::*;
+
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                /// CHECK: bound in Groth16 public inputs (not visible to AST)
+                #[account(mut)]
+                pub recipient: UncheckedAccount<'info>,
+            }
+
+            pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
+                let _data = ctx.accounts.recipient.try_borrow_data()?;
+                Ok(())
+            }
+        "#,
+        );
+
+        let rule = MissingOwnerCheckRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert_eq!(
+            findings.len(),
+            1,
+            "data use without owner must still flag: {findings:?}"
         );
     }
 }

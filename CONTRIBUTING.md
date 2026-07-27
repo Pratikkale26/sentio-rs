@@ -45,6 +45,10 @@ PRs that fix FPs with a regression test are preferred.
 - Discuss large features in an issue first.
 - No drive-by dependency or format-only noise PRs.
 
+## Scope / limitations
+
+Read [docs/LIMITATIONS.md](./docs/LIMITATIONS.md). Sentio is AST-only: **no ZK proof verification, no cross-program trust.**
+
 ## Questions
 
 Use Discord or a GitHub issue. Keep security reports responsible (no exploit dumps against third parties).
