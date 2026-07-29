@@ -43,6 +43,9 @@ sentio scan . --format sarif --output sentio.sarif --fail-on high
 # JSON for tooling / agents
 sentio scan . --format json --output report.json
 
+# Markdown for docs / Discord / Notion
+sentio scan . --format markdown --output report.md
+
 # One rule only
 sentio scan . --rule SW003
 
@@ -72,8 +75,8 @@ Arguments:
   [PATH]                    Directory or .rs file to scan [default: .]
 
 Options:
-  --format <FORMAT>         human (default) | json | sarif
-  --output <FILE>           Write json/sarif output to a file
+  --format <FORMAT>         human (default) | json | sarif | markdown
+  --output <FILE>           Write json/sarif/markdown output to a file
   --rule <RULE_ID>          Run only a specific rule, e.g. --rule SW003
   --include-tests           Include test files (excluded by default)
   --config <FILE>           Path to sentio.toml

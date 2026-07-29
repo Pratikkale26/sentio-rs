@@ -1,4 +1,4 @@
-use sentio_cli::{format_source_excerpt, render_human_report};
+use sentio_cli::{format_source_excerpt, render_human_report, render_markdown_report};
 use sentio_core::{Finding, RuleRegistry, ScanResult, Severity, SourceLocation};
 use std::fs;
 use std::path::PathBuf;
@@ -114,4 +114,34 @@ fn renders_human_report_with_ansi_color_when_enabled() {
     assert!(output.contains("\u{1b}[0m"));
 
     fs::remove_file(path).expect("temp file should be removed");
+}
+
+#[test]
+fn renders_markdown_report() {
+    let result = ScanResult {
+        findings: vec![Finding {
+            rule_id: "SW016".to_string(),
+            severity: Severity::Medium,
+            message: "Account `vault` uses `init_if_needed`.".to_string(),
+            location: SourceLocation {
+                path: "src/lib.rs".to_string(),
+                line: 4,
+                column: 1,
+            },
+            help: Some("Prefer init when possible.".to_string()),
+            suppressed: false,
+        }],
+        files_scanned: 1,
+        files_parsed: 1,
+        parse_failures: Vec::new(),
+        baselined_count: 0,
+    };
+
+    let md = render_markdown_report(&result, &RuleRegistry::baseline());
+    assert!(md.contains("# sentio report"));
+    assert!(md.contains("## Summary"));
+    assert!(md.contains("`SW016`"));
+    assert!(md.contains("**Severity:** medium"));
+    assert!(md.contains("src/lib.rs:4:1"));
+    assert!(md.contains("Prefer init when possible."));
 }

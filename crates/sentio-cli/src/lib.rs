@@ -115,6 +115,111 @@ pub fn render_human_report<W: Write>(
     Ok(())
 }
 
+/// Markdown format!
+/// No source excerpts by default (keeps reports small); includes summary + findings.
+pub fn render_markdown_report(result: &ScanResult, registry: &RuleRegistry) -> String {
+    let mut out = String::new();
+
+    out.push_str("# sentio report\n\n");
+
+    if !result.parse_failures.is_empty() {
+        out.push_str("## Parse failures\n\n");
+        for failure in &result.parse_failures {
+            out.push_str(&format!("- `{}`: {}\n", failure.path, failure.message));
+        }
+        out.push('\n');
+    }
+
+    // Summary first (what people paste most often).
+    let mut rule_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut critical = 0usize;
+    let mut high = 0usize;
+    let mut medium = 0usize;
+    let mut low = 0usize;
+    for finding in &result.findings {
+        *rule_counts.entry(finding.rule_id.clone()).or_default() += 1;
+        match finding.severity {
+            Severity::Critical => critical += 1,
+            Severity::High => high += 1,
+            Severity::Medium => medium += 1,
+            Severity::Low => low += 1,
+        }
+    }
+
+    out.push_str("## Summary\n\n");
+    out.push_str(&format!("- **Total:** {}\n", result.findings.len()));
+    out.push_str(&format!("- **Critical:** {critical}\n"));
+    out.push_str(&format!("- **High:** {high}\n"));
+    out.push_str(&format!("- **Medium:** {medium}\n"));
+    out.push_str(&format!("- **Low:** {low}\n"));
+    if result.baselined_count > 0 {
+        out.push_str(&format!(
+            "- **Baselined (hidden):** {}\n",
+            result.baselined_count
+        ));
+    }
+    out.push_str(&format!(
+        "- **Files scanned / parsed:** {} / {}\n\n",
+        result.files_scanned, result.files_parsed
+    ));
+
+    if !rule_counts.is_empty() {
+        out.push_str("### By rule\n\n");
+        out.push_str("| Count | Rule | Title |\n");
+        out.push_str("|------:|------|-------|\n");
+        for (rule_id, count) in &rule_counts {
+            let title = lookup_metadata(registry, rule_id)
+                .map(|m| m.title)
+                .unwrap_or("Unknown rule");
+            out.push_str(&format!("| {count} | `{rule_id}` | {title} |\n"));
+        }
+        out.push('\n');
+    }
+
+    if result.findings.is_empty() {
+        if result.baselined_count > 0 {
+            out.push_str("No new findings.\n");
+        } else if result.parse_failures.is_empty() {
+            out.push_str("No findings.\n");
+        } else {
+            out.push_str("No findings in successfully parsed files.\n");
+        }
+        return out;
+    }
+
+    out.push_str("## Findings\n\n");
+    for (index, finding) in result.findings.iter().enumerate() {
+        let meta = lookup_metadata(registry, &finding.rule_id);
+        let title = meta.map(|m| m.title).unwrap_or("Unknown rule");
+        let guidance = finding
+            .help
+            .as_deref()
+            .or_else(|| meta.map(|m| m.fix_guidance));
+
+        out.push_str(&format!(
+            "### {}. `{}` — {}\n\n",
+            index + 1,
+            finding.rule_id,
+            title
+        ));
+        out.push_str(&format!(
+            "- **Severity:** {}\n",
+            severity_label(finding.severity)
+        ));
+        out.push_str(&format!(
+            "- **Location:** `{}:{}:{}`\n",
+            finding.location.path, finding.location.line, finding.location.column
+        ));
+        out.push_str(&format!("- **Matched because:** {}\n", finding.message));
+        if let Some(g) = guidance {
+            out.push_str(&format!("- **Guidance:** {g}\n"));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
 pub fn format_source_excerpt(
     path: &str,
     line: usize,
