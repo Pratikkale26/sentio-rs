@@ -8,6 +8,8 @@
 //! install into a single "unique machine" count rather than inflating on
 //! every run. Set `SENTIO_NO_TELEMETRY=1` to disable the ping entirely.
 
+use std::time::Duration;
+
 const NO_TELEMETRY_ENV: &str = "SENTIO_NO_TELEMETRY";
 
 /// Endpoint that receives version-check pings.
@@ -30,16 +32,26 @@ pub fn check_version(installed: &str) -> VersionCheck {
         return VersionCheck { latest: None };
     };
 
-    let mut request = ureq::get(endpoint).query("version", installed);
+    // ureq 3.x: timeouts live on config (Agent or per-request), not RequestBuilder.
+    let mut request = ureq::get(endpoint)
+        .config()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .query("version", installed);
+
     if let Some(id) = telemetry_id() {
         request = request.query("id", &id);
     }
 
     let latest = request
-        .timeout(std::time::Duration::from_secs(2))
         .call()
         .ok()
-        .and_then(|response| response.into_json::<serde_json::Value>().ok())
+        .and_then(|mut response| {
+            response
+                .body_mut()
+                .read_json::<serde_json::Value>()
+                .ok()
+        })
         .and_then(|body| {
             body.get("latest")
                 .and_then(|v| v.as_str())
