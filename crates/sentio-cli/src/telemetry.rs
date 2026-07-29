@@ -46,12 +46,7 @@ pub fn check_version(installed: &str) -> VersionCheck {
     let latest = request
         .call()
         .ok()
-        .and_then(|mut response| {
-            response
-                .body_mut()
-                .read_json::<serde_json::Value>()
-                .ok()
-        })
+        .and_then(|mut response| response.body_mut().read_json::<serde_json::Value>().ok())
         .and_then(|body| {
             body.get("latest")
                 .and_then(|v| v.as_str())
