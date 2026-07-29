@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use sentio_cli::render_human_report;
+use sentio_cli::{render_human_report, render_markdown_report};
 use sentio_core::{
     resolve_config_path, to_sarif_json, Baseline, FailOn, RuleRegistry, ScanOptions, ScanResult,
     Scanner, SentioConfig, Severity,
@@ -84,7 +84,7 @@ struct ScanArgs {
 
 fn run_scan(args: ScanArgs) -> Result<i32> {
     if args.output.is_some() && matches!(args.format, OutputFormat::Human) {
-        bail!("--output requires --format json or --format sarif");
+        bail!("--output requires --format json, sarif, or markdown");
     }
 
     let scan_path = PathBuf::from(&args.path);
@@ -150,6 +150,10 @@ fn run_scan(args: ScanArgs) -> Result<i32> {
             let sarif = to_sarif_json(&result, &registry, env!("CARGO_PKG_VERSION"))
                 .map_err(|e| anyhow::anyhow!(e))?;
             write_or_print(&args.output, &sarif)?;
+        }
+        OutputFormat::Markdown => {
+            let md = render_markdown_report(&result, &registry);
+            write_or_print(&args.output, &md)?;
         }
     }
 
@@ -302,7 +306,7 @@ enum Commands {
         #[arg(long)]
         include_tests: bool,
 
-        /// Write output to a file instead of stdout (json or sarif)
+        /// Write output to a file instead of stdout (json, sarif, or markdown)
         #[arg(long, value_name = "FILE")]
         output: Option<String>,
 
@@ -339,6 +343,8 @@ enum OutputFormat {
     Json,
     /// SARIF 2.1.0 — for GitHub Code Scanning and security dashboards
     Sarif,
+    /// Markdown report
+    Markdown,
 }
 
 #[derive(Debug, Subcommand)]
