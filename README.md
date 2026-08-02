@@ -7,7 +7,6 @@
 <div align="center">
   <p>
     <a href="https://crates.io/crates/sentio-cli"><img src="https://img.shields.io/crates/v/sentio-cli?color=C4531A&label=sentio-cli" alt="sentio-cli version" /></a>
-    <a href="https://crates.io/crates/sentio-cli"><img src="https://img.shields.io/crates/d/sentio-cli?color=6B4C3B&label=downloads" alt="crates.io downloads" /></a>
     <a href="https://crates.io/crates/sentio-core"><img src="https://img.shields.io/crates/v/sentio-core?color=2C1810&label=sentio-core" alt="sentio-core version" /></a>
     <a href="https://github.com/sentio-security/sentio-rs/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/sentio-cli" alt="license" /></a>
   </p>
