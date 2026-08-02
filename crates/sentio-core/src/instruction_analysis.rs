@@ -215,14 +215,36 @@ impl FunctionBodyCollector {
                     extract_account_name_from_str(&val)
                 })
                 .collect(),
+            syn::Expr::Array(a) => a
+                .elems
+                .iter()
+                .flat_map(|e| self.extract_account_names_from_expr(e))
+                .collect(),
+            syn::Expr::Repeat(r) => self.extract_account_names_from_expr(&r.expr),
             syn::Expr::Call(call) => {
                 let func = normalize_tokens(&call.func.to_token_stream().to_string());
                 if func.contains("CpiContext::new") {
-                    if let Some(accounts_arg) = call.args.iter().nth(1) {
-                        return self.extract_account_names_from_expr(accounts_arg);
-                    }
+                    // Collect program + accounts args (both matter for CPI analysis).
+                    return call
+                        .args
+                        .iter()
+                        .flat_map(|arg| self.extract_account_names_from_expr(arg))
+                        .collect();
                 }
+                // `foo.to_account_info()` as a bare call is rare; method form handled below.
                 vec![]
+            }
+            syn::Expr::MethodCall(m) => {
+                let method = m.method.to_string();
+                if method == "to_account_info" || method == "clone" || method == "into" {
+                    let recv = normalize_tokens(&m.receiver.to_token_stream().to_string());
+                    if let Some(name) = extract_account_name_from_str(&recv) {
+                        return vec![name];
+                    }
+                    // Nested: accounts.buyer.to_account_info()
+                    return self.extract_account_names_from_expr(&m.receiver);
+                }
+                self.extract_account_names_from_expr(&m.receiver)
             }
             syn::Expr::Path(p) => {
                 let var = p
@@ -234,6 +256,8 @@ impl FunctionBodyCollector {
                 self.let_bindings.get(&var).cloned().unwrap_or_default()
             }
             syn::Expr::Reference(r) => self.extract_account_names_from_expr(&r.expr),
+            syn::Expr::Paren(p) => self.extract_account_names_from_expr(&p.expr),
+            syn::Expr::Try(t) => self.extract_account_names_from_expr(&t.expr),
             _ => vec![],
         }
     }
@@ -294,12 +318,13 @@ impl<'ast> Visit<'ast> for FunctionBodyCollector {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         let callee = normalize_tokens(&node.func.to_token_stream().to_string());
         let cpi_account_names = if classify_call_kind(&callee) == CallKind::Cpi {
-            let mut found = vec![];
+            // Merge names from all args (invoke metas array + CpiContext builders).
+            let mut found = Vec::new();
             for arg in &node.args {
-                let names = self.extract_account_names_from_expr(arg);
-                if !names.is_empty() {
-                    found = names;
-                    break;
+                for name in self.extract_account_names_from_expr(arg) {
+                    if !found.iter().any(|n| n == &name) {
+                        found.push(name);
+                    }
                 }
             }
             found

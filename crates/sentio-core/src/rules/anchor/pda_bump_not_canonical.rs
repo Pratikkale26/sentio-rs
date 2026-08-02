@@ -11,7 +11,7 @@ impl Rule for PdaBumpNotCanonicalRule {
         static METADATA: RuleMetadata = RuleMetadata {
             id: "SW014",
             title: "PDA bump may not be canonical",
-            severity: RuleSeverity::Medium,
+            severity: RuleSeverity::High,
             description: "Detects PDA accounts where the bump constraint is set to an explicit \
                 bare identifier rather than a stored field (e.g. account.bump). A user-supplied \
                 or re-derived bump may not be the canonical bump, opening a second-preimage \
@@ -59,7 +59,7 @@ impl Rule for PdaBumpNotCanonicalRule {
                 let field_name = field.ast.name.clone().unwrap_or_default();
                 findings.push(RuleMatch {
                     rule_id: "SW014",
-                    severity: RuleSeverity::Medium,
+                    severity: RuleSeverity::High,
                     message: format!(
                         "PDA `{field_name}` uses `bump = {compact}` — verify `{compact}` is \
                         the canonical bump stored on-chain rather than a user-supplied value"

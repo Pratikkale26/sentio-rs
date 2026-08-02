@@ -36,6 +36,12 @@ pub fn handler_loop(_ctx: Context<Deposit>) -> Result<()> {
     Ok(())
 }
 
+/// Safe: unit counter bump — not an economically practical overflow path.
+pub fn handler_unit_counter(ctx: Context<Deposit>) -> Result<()> {
+    ctx.accounts.vault.nft_count += 1;
+    Ok(())
+}
+
 /// Safe: account fields cast to u128 before arithmetic (standard overflow pattern).
 pub fn handler_u128_widen(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     let _ = (amount as u128)
@@ -49,6 +55,7 @@ pub fn handler_u128_widen(ctx: Context<Deposit>, amount: u64) -> Result<()> {
 #[account]
 pub struct Vault {
     pub balance: u64,
+    pub nft_count: u64,
 }
 
 #[error_code]

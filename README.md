@@ -7,7 +7,6 @@
 <div align="center">
   <p>
     <a href="https://crates.io/crates/sentio-cli"><img src="https://img.shields.io/crates/v/sentio-cli?color=C4531A&label=sentio-cli" alt="sentio-cli version" /></a>
-    <a href="https://crates.io/crates/sentio-cli"><img src="https://img.shields.io/crates/d/sentio-cli?color=6B4C3B&label=downloads" alt="crates.io downloads" /></a>
     <a href="https://crates.io/crates/sentio-core"><img src="https://img.shields.io/crates/v/sentio-core?color=2C1810&label=sentio-core" alt="sentio-core version" /></a>
     <a href="https://github.com/sentio-security/sentio-rs/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/sentio-cli" alt="license" /></a>
   </p>
@@ -224,30 +223,32 @@ By rule:
 
 ## Rules
 
-| ID    | Title                        | Severity | What it catches                                                                                                                                                              |
-| ----- | ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SW001 | Missing signer check         | Critical | `AccountInfo`/`UncheckedAccount` named as authority with no `#[account(signer)]` and no `is_signer` guard                                                                    |
-| SW002 | Missing owner check          | Critical | `AccountInfo`/`UncheckedAccount` with no `owner` or `address` constraint and no owner guard in handler                                                                       |
-| SW003 | Arbitrary CPI target         | Critical | Raw `invoke`/`invoke_signed` calls with no preceding program key validation                                                                                                  |
-| SW005 | Unchecked arithmetic         | High     | `+`, `-`, `*`, `+=`, `-=`, `*=` on account fields with no checked math; can overflow in release builds                                                                       |
-| SW006 | Type cosplay                 | Critical | `try_from_slice` without a discriminator check; a malicious account type can be deserialized as another                                                                      |
-| SW008 | Missing post-CPI reload      | High     | Account written after a CPI that may have mutated it, without an intervening `reload()`                                                                                      |
-| SW009 | Missing token mint check     | High     | Mutable `TokenAccount` with no `token::mint` constraint and no `associated_token`, allowing wrong-mint deposits                                                              |
-| SW010 | Missing token owner check    | High     | Mutable `TokenAccount` with no `token::authority` or authority `has_one`, allowing unauthorized withdrawals                                                                  |
-| SW011 | AccountInfo as data account  | Medium   | `AccountInfo` used where a typed `Account<'info, T>` is needed (init/has_one/seeds constraints present)                                                                      |
-| SW012 | Missing seeds + bump on PDA  | High     | PDA accounts with `seeds` but no `bump`, skipping bump verification                                                                                                          |
-| SW013 | PDA seed unvalidated account | High     | PDA seeds reference an `AccountInfo`/`UncheckedAccount` sibling with no `owner`, `address`, or `signer` constraint                                                           |
-| SW014 | PDA bump not canonical       | Medium   | `bump = <bare_identifier>` uses a caller-supplied bump instead of Anchor's canonical derivation                                                                              |
-| SW016 | init_if_needed usage         | Medium   | `init_if_needed` accounts that can be silently re-initialized, resetting state                                                                                               |
-| SW018 | Missing realloc::zero        | Medium   | `realloc` without `realloc::zero = true`, leaving stale data in reallocated memory                                                                                           |
-| SW020 | AccountInfo as CPI program   | Medium   | `AccountInfo` used as a CPI program account instead of typed `Program<'info, T>`                                                                                             |
-| SW021 | PDA seed collision risk      | High     | Adjacent variable-length seeds (e.g. `name.as_bytes()` next to `symbol.as_bytes()`) with no fixed-length seed between them, allowing different inputs to derive the same PDA |
-| SW022 | Missing close constraint     | High     | Manual lamport draining to close accounts without `#[account(close = ...)]`; account data not zeroed, leaving it open to reinitialization with stale data |
-| SW023 | Unvalidated remaining_accounts in CPI | High | `ctx.remaining_accounts` forwarded into a CPI; unconstrained accounts retain outer-transaction signer privileges inside the call, enabling privilege escalation |
-| SW024 | Division by zero | High | Division or modulo where the divisor is a variable or account field with no prior zero-check; a zero divisor panics and fails the transaction |
-| SW025 | unwrap() / expect() in handler | Medium | `.unwrap()` or `.expect()` in instruction code panics on None/Err, failing the transaction with a generic error and exposing a DoS vector on user-controlled inputs |
-| SW026 | create_program_address usage | High | `create_program_address` accepts a caller-supplied bump and does not enforce canonical derivation; use `find_program_address` or Anchor's `seeds + bump` constraint instead |
-| SW027 | Missing event on state change | Low | Instruction handler writes to account state but emits no `emit!()` event, leaving off-chain indexers and audit trails blind to the state transition |
+Severities follow an audit rubric: **Critical** = direct value loss / compromise with minimal preconditions; **High** = value loss or corruption with one clear precondition; **Medium** = needs chaining; **Low** = hygiene.
+
+| ID | Title | Severity |
+| --- | --- | --- |
+| SW001 | Missing signer check | Critical |
+| SW002 | Missing owner check | Critical |
+| SW003 | Arbitrary CPI target | Critical |
+| SW005 | Unchecked arithmetic | High |
+| SW006 | Type cosplay — missing discriminator check | Critical |
+| SW008 | Missing post-CPI account reload | High |
+| SW009 | Missing token account mint check | High |
+| SW010 | Missing token account owner check | Critical |
+| SW011 | AccountInfo used as data account | High |
+| SW012 | Missing seeds + bump on PDA | High |
+| SW013 | PDA seed references unvalidated account | High |
+| SW014 | PDA bump may not be canonical | High |
+| SW016 | init_if_needed usage (manual review) | High |
+| SW018 | Missing realloc::zero = true | Low |
+| SW020 | AccountInfo used as CPI target program | Critical |
+| SW021 | PDA seed collision risk | High |
+| SW022 | Manual account closure without close constraint | High |
+| SW023 | Unvalidated remaining_accounts forwarded to CPI | Critical |
+| SW024 | Division by zero | High |
+| SW025 | unwrap() / expect() in instruction handler | Medium |
+| SW026 | create_program_address used instead of find_program_address | High |
+| SW027 | Missing event emission on state change | Low |
 
 ### Inline Suppressions
 

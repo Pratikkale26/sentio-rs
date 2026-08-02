@@ -4,7 +4,7 @@ use crate::syntax::ParsedFile;
 use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{BinOp, Expr, ExprBinary, ExprCast, ExprParen, ExprUnary, Type};
+use syn::{BinOp, Expr, ExprBinary, ExprCast, ExprParen, ExprUnary, Lit, Type};
 
 #[derive(Debug, Default)]
 pub struct UncheckedArithmeticRule;
@@ -15,8 +15,10 @@ impl Rule for UncheckedArithmeticRule {
             id: "SW005",
             title: "Unchecked arithmetic",
             severity: RuleSeverity::High,
-            description: "Detects arithmetic operations (+, -, *) on account data that can \
-                silently overflow or underflow in release builds, where Rust wraps by default.",
+            description: "Detects unchecked +, -, * on account data with a non-trivial (variable \
+                or non-unit) delta that can silently overflow/underflow in release builds. \
+                Focuses on economically relevant steps (e.g. user-controlled `amount`), not \
+                unit counter bumps like `count += 1` which are not practical overflow attacks.",
             fix_guidance: "Use checked_add(), checked_sub(), or checked_mul() and propagate \
                 the error with ?, or use saturating_add()/saturating_sub() when wrapping is intentional.",
         };
@@ -42,8 +44,9 @@ impl Rule for UncheckedArithmeticRule {
                     column,
                 },
                 help: Some(
-                    "Replace `x += y` with `x = x.checked_add(y).ok_or(ErrorCode::Overflow)?`, \
-                    or use `saturating_add` if overflow should saturate rather than error."
+                    "Replace `x += y` with `x = x.checked_add(y).ok_or(ErrorCode::Overflow)?` \
+                    when `y` is variable or non-unit. Unit steps like `count += 1` are lower risk; \
+                    still prefer checked math for money/supply fields."
                         .to_string(),
                 ),
             })
@@ -58,17 +61,20 @@ struct ArithmeticCollector {
 impl<'ast> Visit<'ast> for ArithmeticCollector {
     fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
         match &node.op {
-            // Compound assignments: +=, -=, *=
-            // Only flag when the target has a field access — loop counters like `i += 1` are skipped.
+            // Compound assignments: +=, -=, *= on account fields.
+            // Skip unit steps (`+= 1`, `-= 1`, `*= 1`) — not practical overflow paths.
             BinOp::AddAssign(_) | BinOp::SubAssign(_) | BinOp::MulAssign(_)
-                if expr_has_field_access(&node.left) && !expr_is_widened_to_128(&node.left) =>
+                if expr_has_field_access(&node.left)
+                    && !expr_is_widened_to_128(&node.left)
+                    && !is_trivial_compound_step(&node.op, &node.right) =>
             {
                 let op = op_symbol(&node.op);
                 let left = node.left.to_token_stream().to_string();
                 let loc = node.left.span().start();
                 self.findings.push((
                     format!(
-                        "unchecked `{op}` on `{}`; can overflow or underflow in release builds",
+                        "unchecked `{op}` on `{}` with non-unit/variable delta; \
+                         can overflow or underflow in release builds",
                         left.split_whitespace().collect::<Vec<_>>().join(" ")
                     ),
                     loc.line,
@@ -76,17 +82,16 @@ impl<'ast> Visit<'ast> for ArithmeticCollector {
                 ));
             }
             // Pure arithmetic: +, -, *
-            // Flag only when account-field operands are not cast to u128/i128 first.
-            // Widening to 128-bit before math is the standard Solana/Anchor overflow pattern
-            // (e.g. `supply as u128 + MINIMUM as u128` inside checked_div).
+            // Flag field-involving ops unless widened to u128/i128, or field ± 1 unit step.
             BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_)
-                if should_flag_binary_arithmetic(&node.left, &node.right) =>
+                if should_flag_binary_arithmetic(&node.op, &node.left, &node.right) =>
             {
                 let op = op_symbol(&node.op);
                 let loc = node.left.span().start();
                 self.findings.push((
                     format!(
-                        "unchecked `{op}` involving account field; can overflow or underflow in release builds"
+                        "unchecked `{op}` involving account field with non-unit/variable delta; \
+                         can overflow or underflow in release builds"
                     ),
                     loc.line,
                     loc.column + 1,
@@ -99,18 +104,62 @@ impl<'ast> Visit<'ast> for ArithmeticCollector {
     }
 }
 
-/// Flag when at least one operand touches account field data AND that field-side is not
-/// widened to 128-bit. Local-only arithmetic stays quiet.
-fn should_flag_binary_arithmetic(left: &Expr, right: &Expr) -> bool {
+/// `+= 1`, `-= 1`, `*= 1` — counter bumps, not attacker-chosen magnitude.
+fn is_trivial_compound_step(op: &BinOp, rhs: &Expr) -> bool {
+    match op {
+        BinOp::AddAssign(_) | BinOp::SubAssign(_) => is_unit_integer_literal(rhs),
+        BinOp::MulAssign(_) => integer_literal_value(rhs) == Some(1),
+        _ => false,
+    }
+}
+
+/// Flag when account-field data is involved without u128 widen, except field ± 1.
+fn should_flag_binary_arithmetic(op: &BinOp, left: &Expr, right: &Expr) -> bool {
     let left_field = expr_has_field_access(left);
     let right_field = expr_has_field_access(right);
     if !left_field && !right_field {
         return false;
     }
-    // Every field-involving operand must be widened; otherwise flag.
+
+    // field + 1 / 1 + field / field - 1 — unit step, skip for + and -
+    if matches!(op, BinOp::Add(_) | BinOp::Sub(_)) && is_field_unit_step(left, right) {
+        return false;
+    }
+
     let left_risky = left_field && !expr_is_widened_to_128(left);
     let right_risky = right_field && !expr_is_widened_to_128(right);
     left_risky || right_risky
+}
+
+/// True when one side is a field path and the other is literal `1` (add/sub only).
+fn is_field_unit_step(left: &Expr, right: &Expr) -> bool {
+    let left_field = expr_has_field_access(left);
+    let right_field = expr_has_field_access(right);
+    (left_field && !right_field && is_unit_integer_literal(right))
+        || (right_field && !left_field && is_unit_integer_literal(left))
+}
+
+fn is_unit_integer_literal(expr: &Expr) -> bool {
+    integer_literal_value(expr) == Some(1)
+}
+
+fn integer_literal_value(expr: &Expr) -> Option<u128> {
+    match peel_expr(expr) {
+        Expr::Lit(expr_lit) => match &expr_lit.lit {
+            Lit::Int(int_lit) => int_lit.base10_parse::<u128>().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn peel_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(ExprParen { expr, .. }) => peel_expr(expr),
+        Expr::Group(g) => peel_expr(&g.expr),
+        Expr::Reference(r) => peel_expr(&r.expr),
+        other => other,
+    }
 }
 
 fn expr_has_field_access(expr: &Expr) -> bool {
@@ -122,21 +171,18 @@ fn expr_has_field_access(expr: &Expr) -> bool {
         Expr::Reference(r) => expr_has_field_access(&r.expr),
         Expr::Try(t) => expr_has_field_access(&t.expr),
         Expr::MethodCall(m) => {
-            // `pool.amount.checked_add(x)` — field is on the receiver path
             expr_has_field_access(&m.receiver) || m.args.iter().any(expr_has_field_access)
         }
         Expr::Call(c) => expr_has_field_access(&c.func) || c.args.iter().any(expr_has_field_access),
         Expr::Binary(b) => expr_has_field_access(&b.left) || expr_has_field_access(&b.right),
         Expr::Path(_) | Expr::Lit(_) => false,
         _ => {
-            // Fallback for unusual shapes: token string with a real field-like dot.
             let s = expr.to_token_stream().to_string();
             token_string_has_field_access(&s)
         }
     }
 }
 
-/// True when the expression (after parens/refs) is `… as u128` or `… as i128`.
 fn expr_is_widened_to_128(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(ExprParen { expr, .. }) => expr_is_widened_to_128(expr),
@@ -160,7 +206,6 @@ fn type_is_128_bit(ty: &Type) -> bool {
 
 fn token_string_has_field_access(expr: &str) -> bool {
     let trimmed = expr.trim();
-    // Exclude float literals like "1.0" or "3.14_f64".
     if trimmed.chars().all(|c| {
         c.is_ascii_digit()
             || c == '.'
@@ -230,6 +275,39 @@ mod tests {
     }
 
     #[test]
+    fn does_not_flag_unit_counter_increment() {
+        // Auditor thesis: += 1 is not an economically practical overflow attack.
+        let file = parse_file(
+            r#"
+            use anchor_lang::prelude::*;
+            pub fn mint_one(ctx: Context<MintNft>) -> Result<()> {
+                ctx.accounts.profile.nft_count += 1;
+                Ok(())
+            }
+        "#,
+        );
+        assert!(
+            run(&file).is_empty(),
+            "unit step += 1 must not be SW005: {:?}",
+            run(&file)
+        );
+    }
+
+    #[test]
+    fn does_not_flag_unit_counter_decrement() {
+        let file = parse_file(
+            r#"
+            use anchor_lang::prelude::*;
+            pub fn burn_one(ctx: Context<Burn>) -> Result<()> {
+                ctx.accounts.profile.nft_count -= 1;
+                Ok(())
+            }
+        "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
     fn flags_sub_assign_and_mul_on_account_field() {
         let file = parse_file(
             r#"
@@ -296,7 +374,6 @@ mod tests {
 
     #[test]
     fn does_not_flag_u128_widened_account_field_add() {
-        // Foundation token-swap style: widen then add constant inside checked_div.
         let file = parse_file(
             r#"
             use anchor_lang::prelude::*;
@@ -374,5 +451,19 @@ mod tests {
             !findings.is_empty(),
             "raw u64 fee math should still flag: {findings:?}"
         );
+    }
+
+    #[test]
+    fn still_flags_add_assign_with_literal_other_than_one() {
+        let file = parse_file(
+            r#"
+            use anchor_lang::prelude::*;
+            pub fn handler(ctx: Context<Deposit>) -> Result<()> {
+                ctx.accounts.vault.balance += 100;
+                Ok(())
+            }
+        "#,
+        );
+        assert_eq!(run(&file).len(), 1);
     }
 }

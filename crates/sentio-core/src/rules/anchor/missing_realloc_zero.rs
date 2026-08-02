@@ -11,7 +11,7 @@ impl Rule for MissingReallocZeroRule {
         static METADATA: RuleMetadata = RuleMetadata {
             id: "SW018",
             title: "Missing realloc::zero = true",
-            severity: RuleSeverity::Medium,
+            severity: RuleSeverity::Low,
             description: "Detects realloc usage without realloc::zero = true. Without zeroing, reallocated memory may contain stale data readable by the program or attackers.",
             fix_guidance: "Add realloc::zero = true to your #[account(realloc = ..., realloc::zero = true, realloc_authority = ...)] constraint.",
         };
@@ -27,7 +27,7 @@ impl Rule for MissingReallocZeroRule {
                 if field.constraints.realloc && !field.constraints.realloc_zero {
                     findings.push(RuleMatch {
                         rule_id: "SW018",
-                        severity: RuleSeverity::Medium,
+                        severity: RuleSeverity::Low,
                         message: format!(
                             "Account `{}` uses `realloc` without `realloc::zero = true`; reallocated memory may contain stale data.",
                             field.ast.name.clone().unwrap_or_default()
