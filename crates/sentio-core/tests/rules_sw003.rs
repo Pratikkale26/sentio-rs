@@ -4,8 +4,21 @@ mod common;
 fn sw003_flags_risky_fixture() {
     let result = common::scan_fixture("sw003/risky.rs", "SW003");
 
-    assert_eq!(result.findings.len(), 1);
-    assert_eq!(result.findings[0].rule_id, "SW003");
+    assert!(
+        result.findings.len() >= 2,
+        "expected unvalidated CPI + confused-deputy style cases: {:?}",
+        result.findings
+    );
+    assert!(result.findings.iter().all(|f| f.rule_id == "SW003"));
+    assert!(
+        result
+            .findings
+            .iter()
+            .any(|f| f.message.to_lowercase().contains("signer")
+                || f.message.to_lowercase().contains("confused")),
+        "expected confused-deputy messaging: {:?}",
+        result.findings
+    );
 }
 
 #[test]
