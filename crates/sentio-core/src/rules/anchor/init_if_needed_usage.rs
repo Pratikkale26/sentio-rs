@@ -11,7 +11,7 @@ impl Rule for InitIfNeededUsageRule {
         static METADATA: RuleMetadata = RuleMetadata {
             id: "SW016",
             title: "init_if_needed usage (manual review)",
-            severity: RuleSeverity::Medium,
+            severity: RuleSeverity::High,
             description:
                 "Flags Anchor account fields using init_if_needed because the pattern can permit unintended re-initialization or state reset.",
             fix_guidance:
@@ -42,7 +42,7 @@ impl Rule for InitIfNeededUsageRule {
                 let field_name = field.ast.name.clone().unwrap_or_default();
                 findings.push(RuleMatch {
                     rule_id: "SW016",
-                    severity: RuleSeverity::Medium,
+                    severity: RuleSeverity::High,
                     message: format!(
                         "Account `{field_name}` uses `init_if_needed`; review for re-initialization or state-reset risk."
                     ),

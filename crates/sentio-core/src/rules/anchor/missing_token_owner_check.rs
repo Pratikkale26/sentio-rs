@@ -13,7 +13,7 @@ impl Rule for MissingTokenOwnerCheckRule {
         static METADATA: RuleMetadata = RuleMetadata {
             id: "SW010",
             title: "Missing token account owner check",
-            severity: RuleSeverity::High,
+            severity: RuleSeverity::Critical,
             description: "Detects mutable token account fields that have no token::authority or \
                 associated_token::authority constraint, allowing an attacker to substitute a token \
                 account they control as the signer's account.",
@@ -46,7 +46,7 @@ impl Rule for MissingTokenOwnerCheckRule {
                 let name = field.ast.name.clone().unwrap_or_default();
                 findings.push(RuleMatch {
                     rule_id: "SW010",
-                    severity: RuleSeverity::High,
+                    severity: RuleSeverity::Critical,
                     message: format!(
                         "Mutable token account `{name}` has no `token::authority` constraint; \
                         an attacker can pass a token account they own as the signer's account"

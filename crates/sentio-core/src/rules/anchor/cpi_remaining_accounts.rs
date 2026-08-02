@@ -11,7 +11,7 @@ impl Rule for CpiRemainingAccountsRule {
         static METADATA: RuleMetadata = RuleMetadata {
             id: "SW023",
             title: "Unvalidated remaining_accounts forwarded to CPI",
-            severity: RuleSeverity::High,
+            severity: RuleSeverity::Critical,
             description: "Detects instruction handlers that forward ctx.remaining_accounts into a \
                           CPI call. Accounts in remaining_accounts are not declared in the Accounts \
                           struct so they carry no type, owner, or signer constraints. Any account \
@@ -57,7 +57,7 @@ impl Rule for CpiRemainingAccountsRule {
             if let Some(cpi_call) = cpi_calls.first() {
                 findings.push(RuleMatch {
                     rule_id: "SW023",
-                    severity: RuleSeverity::High,
+                    severity: RuleSeverity::Critical,
                     message: format!(
                         "Function `{}` forwards `remaining_accounts` into a CPI; unvalidated \
                          accounts retain outer-transaction signer privileges inside the call.",
