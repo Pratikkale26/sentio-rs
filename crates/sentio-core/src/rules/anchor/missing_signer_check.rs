@@ -135,11 +135,15 @@ fn native_findings(file: &ParsedFile) -> Vec<RuleMatch> {
 
     for handler in &index.handlers {
         for account in &handler.accounts {
+            // Match on the name's head noun (last `_` token): `pool_admin` and
+            // `update_authority` are authorities; `admin_token_a` is a token
+            // account that merely belongs to the admin. The Anchor layer can
+            // afford substring matching because field types filter data
+            // accounts out — native bindings are untyped.
             let name_lower = account.name.to_lowercase();
-            let is_authority_named = name_lower.contains("authority")
-                || name_lower.contains("admin")
-                || name_lower == "signer"
-                || name_lower.contains("initializer");
+            let head = name_lower.rsplit('_').find(|t| !t.is_empty()).unwrap_or("");
+            let is_authority_named =
+                matches!(head, "authority" | "admin" | "signer" | "initializer");
             if !is_authority_named {
                 continue;
             }

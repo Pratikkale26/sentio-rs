@@ -196,7 +196,9 @@ impl FileCollector {
         // of the binding at identifier boundaries, and how many of those are
         // immediately followed by `.key`. The binding statement itself
         // contributes one occurrence — subtracted below.
-        let body_text = compact(block);
+        // Token-stream spacing is kept so identifier boundaries survive
+        // (`let authority` must not become `letauthority`).
+        let body_text = block.to_token_stream().to_string();
         for account in &mut body.accounts {
             let (refs, key_refs) = count_references(&body_text, &account.name);
             account.reference_count = refs.saturating_sub(1);
@@ -551,8 +553,9 @@ fn references_account(text: &str, name: &str) -> bool {
     false
 }
 
-/// Counts identifier-boundary occurrences of `name` in `text`, and how many
-/// of them are immediately followed by `.key` (field or method access).
+/// Counts identifier-boundary occurrences of `name` in `text` (token-stream
+/// spacing), and how many of them read `.key`. Struct-literal field labels
+/// (`admin: ..`) are not references to the binding and are skipped.
 fn count_references(text: &str, name: &str) -> (usize, usize) {
     let mut refs = 0;
     let mut key_refs = 0;
@@ -563,14 +566,37 @@ fn count_references(text: &str, name: &str) -> (usize, usize) {
         let after = idx + name.len();
         let after_ok = after >= text.len()
             || !text.as_bytes()[after].is_ascii_alphanumeric() && text.as_bytes()[after] != b'_';
-        if before_ok && after_ok {
-            refs += 1;
-            if text[after..].starts_with(".key") {
-                key_refs += 1;
-            }
+        if !(before_ok && after_ok) {
+            continue;
+        }
+        let rest = text[after..].trim_start();
+        // `name : expr` (single colon) is a struct field label, not a use of
+        // the binding; `name ::` is path syntax and stays a reference.
+        if rest.starts_with(':') && !rest.starts_with("::") {
+            continue;
+        }
+        refs += 1;
+        if follows_key(rest) {
+            key_refs += 1;
         }
     }
     (refs, key_refs)
+}
+
+/// True when the text after an account reference reads `.key` (field or
+/// method), tolerating token-stream spacing (`authority . key ()`).
+fn follows_key(rest: &str) -> bool {
+    let Some(t) = rest.strip_prefix('.') else {
+        return false;
+    };
+    let t = t.trim_start();
+    let Some(after_key) = t.strip_prefix("key") else {
+        return false;
+    };
+    match after_key.as_bytes().first() {
+        None => true,
+        Some(c) => !c.is_ascii_alphanumeric() && *c != b'_',
+    }
 }
 
 /// True when a key comparison pins `name` against something constant — a
