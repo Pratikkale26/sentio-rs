@@ -92,6 +92,15 @@ pub struct NativeAccountBinding {
     /// during the inner instruction (privilege propagation), so an explicit
     /// is_signer is defense-in-depth rather than the security boundary.
     pub forwarded_to_cpi: bool,
+    /// The account's data is read or deserialized in the handler
+    /// (`try_borrow_data`, `T::from_account_info`, `try_from_slice`,
+    /// `unpack`, `load` — directly or through a `let alias = account;`).
+    pub data_accessed: bool,
+    /// The account is created inside this handler (`create_program_account`
+    /// helper, `system_instruction::create_account`, or a pinocchio
+    /// `CreateAccount { .. }.invoke*()`), so its owner is being established
+    /// here rather than trusted.
+    pub created_in_handler: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -205,6 +214,8 @@ impl FileCollector {
             account.key_reference_count = key_refs;
             account.used_as_derivation_seed = body.seed_sources.contains(&account.name);
             account.forwarded_to_cpi = body.cpi_forwarded.contains(&account.name);
+            account.data_accessed = body.data_read.contains(&account.name);
+            account.created_in_handler = body.created.contains(&account.name);
         }
 
         let name = sig.ident.to_string();
@@ -283,6 +294,12 @@ struct BodyCollector {
     seed_sources: std::collections::HashSet<String>,
     /// Account names forwarded into CPI calls or instruction builders.
     cpi_forwarded: std::collections::HashSet<String>,
+    /// Alias name → root binding name (`let counter_account = counter;`).
+    aliases: std::collections::HashMap<String, String>,
+    /// Root names whose data is read/deserialized.
+    data_read: std::collections::HashSet<String>,
+    /// Root names created inside the handler.
+    created: std::collections::HashSet<String>,
 }
 
 impl BodyCollector {
@@ -291,8 +308,18 @@ impl BodyCollector {
         self.next_order
     }
 
-    fn account_names(&self) -> Vec<String> {
-        self.accounts.iter().map(|a| a.name.clone()).collect()
+    /// Searchable names with their root binding name — each binding under
+    /// its own name plus any aliases pointing at it.
+    fn search_names(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .accounts
+            .iter()
+            .map(|a| (a.name.clone(), a.name.clone()))
+            .collect();
+        for (alias, root) in &self.aliases {
+            out.push((alias.clone(), root.clone()));
+        }
+        out
     }
 
     fn record_condition(&mut self, cond: &syn::Expr) {
@@ -300,12 +327,12 @@ impl BodyCollector {
         let span = span_of(cond.span());
         // Evaluate against a snapshot of the names bound so far — a check can
         // only reference accounts extracted before it.
-        for name in self.account_names() {
-            for kind in classify_condition(&text, &name, &self.derived_vars) {
+        for (search, root) in self.search_names() {
+            for kind in classify_condition(&text, &search, &self.derived_vars) {
                 let order = self.order();
                 self.checks.push(NativeCheck {
                     kind,
-                    account: name.clone(),
+                    account: root.clone(),
                     expression: text.clone(),
                     span,
                     order,
@@ -331,11 +358,11 @@ impl BodyCollector {
     }
 
     fn record_write_target(&mut self, target_text: String, span: proc_macro2::Span) {
-        for name in self.account_names() {
-            if references_account(&target_text, &name) {
+        for (search, root) in self.search_names() {
+            if references_account(&target_text, &search) {
                 let order = self.order();
                 self.writes.push(NativeWrite {
-                    account: name.clone(),
+                    account: root.clone(),
                     target: target_text.clone(),
                     span: span_of(span),
                     order,
@@ -371,6 +398,8 @@ impl<'ast> Visit<'ast> for BodyCollector {
                                 key_reference_count: 0,
                                 used_as_derivation_seed: false,
                                 forwarded_to_cpi: false,
+                                data_accessed: false,
+                                created_in_handler: false,
                             });
                         }
                     }
@@ -398,6 +427,31 @@ impl<'ast> Visit<'ast> for BodyCollector {
             }
         }
 
+        // Plain aliases: `let counter_account = counter;` (optionally `&x` /
+        // `x.clone()`) — common in transpiler output before shadowing the
+        // original name with the deserialized state struct.
+        if let (syn::Pat::Ident(ident), Some(init)) = (&node.pat, &node.init) {
+            let mut t = compact(&init.expr);
+            if let Some(stripped) = t.strip_prefix('&') {
+                t = stripped.to_string();
+            }
+            if let Some(stripped) = t.strip_suffix(".clone()") {
+                t = stripped.to_string();
+            }
+            let root = self
+                .accounts
+                .iter()
+                .find(|a| a.name == t)
+                .map(|a| a.name.clone())
+                .or_else(|| self.aliases.get(&t).cloned());
+            if let Some(root) = root {
+                let alias = ident.ident.to_string();
+                if alias != root {
+                    self.aliases.insert(alias, root);
+                }
+            }
+        }
+
         // `let x = next_account_info(iter)?` and `let x = &accounts[0]`.
         if let (syn::Pat::Ident(ident), Some(init)) = (&node.pat, &node.init) {
             let init_text = compact(&init.expr);
@@ -413,6 +467,8 @@ impl<'ast> Visit<'ast> for BodyCollector {
                     key_reference_count: 0,
                     used_as_derivation_seed: false,
                     forwarded_to_cpi: false,
+                    data_accessed: false,
+                    created_in_handler: false,
                 });
             } else if let Some(position) = slice_index_of(&init_text, &self.accounts_param) {
                 self.accounts.push(NativeAccountBinding {
@@ -424,6 +480,8 @@ impl<'ast> Visit<'ast> for BodyCollector {
                     key_reference_count: 0,
                     used_as_derivation_seed: false,
                     forwarded_to_cpi: false,
+                    data_accessed: false,
+                    created_in_handler: false,
                 });
             }
         }
@@ -443,24 +501,53 @@ impl<'ast> Visit<'ast> for BodyCollector {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         let callee = compact(&node.func);
         if callee.contains("program_address") || callee.contains("bump_seed") {
-            for name in self.account_names() {
+            for (search, root) in self.search_names() {
                 if node
                     .args
                     .iter()
-                    .any(|arg| references_account(&compact(arg), &name))
+                    .any(|arg| references_account(&compact(arg), &search))
                 {
-                    self.seed_sources.insert(name);
+                    self.seed_sources.insert(root);
                 }
             }
         }
         if callee.contains("invoke") || callee.contains("instruction::") {
-            for name in self.account_names() {
+            for (search, root) in self.search_names() {
                 if node
                     .args
                     .iter()
-                    .any(|arg| references_account(&compact(arg), &name))
+                    .any(|arg| references_account(&compact(arg), &search))
                 {
-                    self.cpi_forwarded.insert(name);
+                    self.cpi_forwarded.insert(root);
+                }
+            }
+        }
+        // Data deserializers taking the account as an argument.
+        if callee.contains("from_account_info")
+            || callee.contains("try_from_slice")
+            || callee.contains("::unpack")
+            || callee.contains("::load")
+            || callee.contains("from_bytes")
+        {
+            for (search, root) in self.search_names() {
+                if node
+                    .args
+                    .iter()
+                    .any(|arg| references_account(&compact(arg), &search))
+                {
+                    self.data_read.insert(root);
+                }
+            }
+        }
+        // In-handler account creation: owner is being established, not trusted.
+        if callee.contains("create_program_account") || callee.contains("create_account") {
+            for (search, root) in self.search_names() {
+                if node
+                    .args
+                    .iter()
+                    .any(|arg| references_account(&compact(arg), &search))
+                {
+                    self.created.insert(root);
                 }
             }
         }
@@ -502,9 +589,31 @@ impl<'ast> Visit<'ast> for BodyCollector {
         let m = node.method.to_string();
         if m == "invoke" || m == "invoke_signed" {
             let recv = compact(&node.receiver);
-            for name in self.account_names() {
-                if references_account(&recv, &name) {
-                    self.cpi_forwarded.insert(name);
+            for (search, root) in self.search_names() {
+                if references_account(&recv, &search) {
+                    self.cpi_forwarded.insert(root.clone());
+                    // pinocchio CreateAccount { .. }.invoke() creates the
+                    // referenced account.
+                    if recv.contains("CreateAccount") {
+                        self.created.insert(root);
+                    }
+                }
+            }
+        }
+        // Data reads on the receiver (field or method form).
+        if matches!(
+            m.as_str(),
+            "try_borrow_data"
+                | "borrow_data"
+                | "borrow_data_unchecked"
+                | "data"
+                | "try_borrow_mut_data"
+                | "borrow_mut_data_unchecked"
+        ) {
+            let recv = compact(&node.receiver);
+            for (search, root) in self.search_names() {
+                if references_account(&recv, &search) {
+                    self.data_read.insert(root);
                 }
             }
         }

@@ -1,6 +1,7 @@
 use crate::anchor_accounts::{collect_anchor_accounts_index, AnchorFieldTypeKind};
 use crate::finding::SourceLocation;
 use crate::instruction_analysis::{analyze_account_field_usage, collect_instruction_index};
+use crate::native_accounts::{collect_native_index, NativeCheckKind};
 use crate::rules::{Rule, RuleContext, RuleMatch, RuleMetadata, RuleSeverity};
 use crate::syntax::ParsedFile;
 
@@ -100,8 +101,72 @@ impl Rule for MissingOwnerCheckRule {
             }
         }
 
+        findings.extend(native_findings(file));
+
         findings
     }
+}
+
+/// Native / pinocchio layer: an account whose data the handler deserializes
+/// or reads without any owner verification (`is_owned_by` / `owner ==`) and
+/// without an address pin lets an attacker pass a lookalike account owned by
+/// any program — the same trust gap as an unchecked `AccountInfo` field in
+/// Anchor.
+fn native_findings(file: &ParsedFile) -> Vec<RuleMatch> {
+    let index = collect_native_index(&file.syntax);
+    let mut findings = Vec::new();
+
+    for handler in &index.handlers {
+        for account in &handler.accounts {
+            // Program accounts are SW020's domain (mirrors the Anchor layer).
+            if account.name.to_lowercase().contains("program") {
+                continue;
+            }
+
+            // Only accounts whose data is actually trusted.
+            if !account.data_accessed {
+                continue;
+            }
+
+            // Owner verified, or identity constrained by address pin / PDA
+            // derivation (an account at this program's PDA cannot be created
+            // by another program's authority without our signature).
+            if handler.has_check(&account.name, NativeCheckKind::Owner)
+                || handler.has_check(&account.name, NativeCheckKind::Key)
+                || handler.has_check(&account.name, NativeCheckKind::PdaDerivation)
+            {
+                continue;
+            }
+
+            // Created in this handler: the owner is being established by the
+            // creation CPI, not trusted from the caller.
+            if account.created_in_handler {
+                continue;
+            }
+
+            findings.push(RuleMatch {
+                rule_id: "SW002",
+                severity: RuleSeverity::Critical,
+                message: format!(
+                    "Account `{}` in handler `{}` has its data read without any owner \
+                     check; any program-owned account can be passed.",
+                    account.name, handler.name
+                ),
+                location: SourceLocation {
+                    path: file.path.display().to_string(),
+                    line: account.span.start_line,
+                    column: 1,
+                },
+                help: Some(
+                    "Verify ownership before trusting data: `if account.owner != program_id` \
+                     (solana_program) or `if !account.is_owned_by(program_id)` (pinocchio)."
+                        .to_string(),
+                ),
+            });
+        }
+    }
+
+    findings
 }
 
 #[cfg(test)]
@@ -459,5 +524,131 @@ mod tests {
             1,
             "data use without owner must still flag: {findings:?}"
         );
+    }
+
+    // ─── native / pinocchio layer ───────────────────────────────────────────
+
+    fn run(file: &ParsedFile) -> Vec<RuleMatch> {
+        MissingOwnerCheckRule.match_file(
+            file,
+            &RuleContext {
+                files: std::slice::from_ref(file),
+            },
+        )
+    }
+
+    #[test]
+    fn native_flags_deserialization_without_owner_check() {
+        // Transpiler alias shape: `let counter_account = counter;` then
+        // deserialize through the alias — the owner check is absent.
+        let file = parse_file(
+            r#"
+            pub fn increment(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+                let counter = &accounts[0];
+                let authority = &accounts[1];
+                if !authority.is_signer() {
+                    return Err(ProgramError::MissingRequiredSignature);
+                }
+                let counter_account = counter;
+                let mut counter = CounterAccount::from_account_info(counter_account)?;
+                counter.count += 1;
+                CounterAccount::save(counter_account, &counter)?;
+                Ok(())
+            }
+            "#,
+        );
+        let findings = run(&file);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("`counter`"));
+    }
+
+    #[test]
+    fn native_does_not_flag_owner_checked_account() {
+        let file = parse_file(
+            r#"
+            pub fn increment(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+                let counter = &accounts[0];
+                if counter.owner() != program_id {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+                let counter_account = counter;
+                let mut counter = CounterAccount::from_account_info(counter_account)?;
+                counter.count += 1;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn native_does_not_flag_is_owned_by_pinocchio_form() {
+        let file = parse_file(
+            r#"
+            pub fn increment(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let [counter] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                if !counter.is_owned_by(program_id) {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+                let state = CounterAccount::from_account_info(counter)?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn native_does_not_flag_account_created_in_handler() {
+        let file = parse_file(
+            r#"
+            pub fn initialize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let [counter, payer] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                if !payer.is_signer() {
+                    return Err(ProgramError::MissingRequiredSignature);
+                }
+                create_program_account(counter, payer, 16, program_id, &[])?;
+                let mut state = CounterAccount::from_account_info(counter)?;
+                state.count = 0;
+                CounterAccount::save(counter, &state)?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn native_does_not_flag_accounts_without_data_reads() {
+        let file = parse_file(
+            r#"
+            pub fn transfer(accounts: &[AccountInfo]) -> ProgramResult {
+                let [payer, recipient] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                if !payer.is_signer() {
+                    return Err(ProgramError::MissingRequiredSignature);
+                }
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn native_does_not_flag_pda_derivation_checked_account() {
+        let file = parse_file(
+            r#"
+            pub fn read_state(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let [vault] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                let (expected, _bump) = find_program_address(&[b"vault"], program_id);
+                if vault.key() != &expected {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                let state = Vault::from_account_info(vault)?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
     }
 }
