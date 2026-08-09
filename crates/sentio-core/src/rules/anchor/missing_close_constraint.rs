@@ -4,7 +4,7 @@ use crate::instruction_analysis::collect_instruction_index;
 use crate::rules::{Rule, RuleContext, RuleMatch, RuleMetadata, RuleSeverity};
 use crate::syntax::ParsedFile;
 use quote::ToTokens;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use syn::visit::{self, Visit};
 
 #[derive(Debug, Default)]
@@ -48,6 +48,8 @@ impl Rule for MissingCloseConstraintRule {
         // and "borrow_mut" — the canonical pattern for manual account closure.
         // Report once per function (both the drain and the recipient top-up match,
         // but they describe the same closure operation).
+        let full_drains = collect_full_drain_sites(&file.syntax);
+
         for function in &instruction_index.functions {
             // A function that pairs the drain with the full safe-close sequence
             // (reassign to the System Program + shrink data to zero, or a
@@ -56,9 +58,17 @@ impl Rule for MissingCloseConstraintRule {
             if safe_close_fns.contains(&function.name) {
                 continue;
             }
+            // Only a FULL drain (balance set to 0, or the account's whole
+            // lamport balance subtracted) is a close. Partial moves — rent
+            // top-ups on realloc, refunds on shrink — leave a live account
+            // and are not a revival risk.
             let drain = function.writes.iter().find(|w| {
                 let t = w.target.to_lowercase();
-                t.contains("lamports") && t.contains("borrow_mut")
+                t.contains("lamports")
+                    && t.contains("borrow_mut")
+                    && full_drains
+                        .iter()
+                        .any(|(f, line)| f == &function.name && *line == w.span.start_line)
             });
             if let Some(write) = drain {
                 findings.push(RuleMatch {
@@ -86,6 +96,119 @@ impl Rule for MissingCloseConstraintRule {
 
         findings
     }
+}
+
+/// Collects `(fn_name, line)` sites where an account's lamports are FULLY
+/// drained: `**x.lamports.borrow_mut() = 0`, or `-=`/`= .. - ..` of the
+/// account's entire balance (directly or via a local bound to
+/// `x.lamports()`). Partial moves (rent top-ups, shrink refunds) don't
+/// qualify.
+fn collect_full_drain_sites(file: &syn::File) -> Vec<(String, usize)> {
+    use syn::spanned::Spanned;
+
+    fn compact(tokens: impl quote::ToTokens) -> String {
+        tokens.to_token_stream().to_string().replace(' ', "")
+    }
+
+    /// Base identifier of a lamports write target:
+    /// `**offer_info.lamports.borrow_mut()` → `offer_info`.
+    fn base_ident(target: &str) -> String {
+        target
+            .trim_start_matches(['*', '&', '('])
+            .split(['.', '[', ')'])
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    struct Collector {
+        fn_stack: Vec<String>,
+        /// local var → compact source expr for `let v = <expr>.lamports();`
+        balance_vars: HashMap<String, String>,
+        out: Vec<(String, usize)>,
+    }
+
+    impl Collector {
+        fn is_lamports_target(text: &str) -> bool {
+            let t = text.to_lowercase();
+            t.contains("lamports") && t.contains("borrow_mut")
+        }
+
+        fn record(&mut self, span: proc_macro2::Span) {
+            if let Some(f) = self.fn_stack.last() {
+                self.out.push((f.clone(), span.start().line));
+            }
+        }
+
+        /// Does `rhs` amount to the account's full balance? Either it reads
+        /// `<base>.lamports()` directly, or it is a local previously bound to
+        /// that read.
+        fn rhs_is_full_balance(&self, rhs: &str, base: &str) -> bool {
+            if rhs.contains(&format!("{base}.lamports()")) {
+                return true;
+            }
+            self.balance_vars
+                .get(rhs)
+                .is_some_and(|src| src.contains(&format!("{base}.lamports()")))
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Collector {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            self.fn_stack.push(node.sig.ident.to_string());
+            visit::visit_item_fn(self, node);
+            self.fn_stack.pop();
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            self.fn_stack.push(node.sig.ident.to_string());
+            visit::visit_impl_item_fn(self, node);
+            self.fn_stack.pop();
+        }
+
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            if let (syn::Pat::Ident(ident), Some(init)) = (&node.pat, &node.init) {
+                let text = compact(&init.expr);
+                if text.contains(".lamports()") {
+                    self.balance_vars.insert(ident.ident.to_string(), text);
+                }
+            }
+            visit::visit_local(self, node);
+        }
+
+        fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+            let left = compact(&node.left);
+            if Self::is_lamports_target(&left) {
+                let rhs = compact(&node.right);
+                if rhs == "0" || rhs.starts_with("0u") || rhs.starts_with("0i") {
+                    self.record(node.span());
+                }
+            }
+            visit::visit_expr_assign(self, node);
+        }
+
+        fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+            if matches!(node.op, syn::BinOp::SubAssign(_)) {
+                let left = compact(&node.left);
+                if Self::is_lamports_target(&left) {
+                    let rhs = compact(&node.right);
+                    let base = base_ident(&left);
+                    if self.rhs_is_full_balance(&rhs, &base) {
+                        self.record(node.span());
+                    }
+                }
+            }
+            visit::visit_expr_binary(self, node);
+        }
+    }
+
+    let mut collector = Collector {
+        fn_stack: Vec::new(),
+        balance_vars: HashMap::new(),
+        out: Vec::new(),
+    };
+    collector.visit_file(file);
+    collector.out
 }
 
 /// Collects names of functions whose body performs a SAFE manual close —
@@ -358,6 +481,57 @@ mod tests {
         );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "SW022");
+    }
+
+    #[test]
+    fn does_not_flag_partial_rent_refund_on_shrink() {
+        // Transpiled realloc shape: shrink refunds the rent DELTA — the
+        // account stays alive above rent minimum. Not a close.
+        let file = parse_file(
+            r#"
+            pub fn append(state: &AccountInfo, owner: &AccountInfo, new_size: usize) -> ProgramResult {
+                let __cur_lamports = state.lamports();
+                let __new_rent_minimum = 1000000u64;
+                let __refund = __cur_lamports - __new_rent_minimum;
+                *state.try_borrow_mut_lamports()? = __cur_lamports - __refund;
+                *owner.try_borrow_mut_lamports()? = owner.lamports() + __refund;
+                state.realloc(new_size, false)?;
+                Ok(())
+            }
+            "#,
+        );
+        let rule = MissingCloseConstraintRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn still_flags_full_drain_via_balance_local() {
+        // `let bal = x.lamports(); **x...borrow_mut() -= bal;` empties the
+        // account — a close without cleanup, still flagged.
+        let file = parse_file(
+            r#"
+            pub fn drain(target: &AccountInfo, receiver: &AccountInfo) -> ProgramResult {
+                let bal = target.lamports();
+                **receiver.lamports.borrow_mut() += bal;
+                **target.lamports.borrow_mut() -= bal;
+                Ok(())
+            }
+            "#,
+        );
+        let rule = MissingCloseConstraintRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]
