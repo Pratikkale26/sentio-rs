@@ -32,6 +32,8 @@ impl Rule for ArbitraryCpiRule {
         let signer_fields = collect_signer_field_names(&accounts);
         let mut findings = Vec::new();
 
+        let const_invoke_lines = collect_const_program_invoke_lines(&file.syntax);
+
         for function in &index.functions {
             let cpi_calls: Vec<_> = function
                 .calls
@@ -45,6 +47,16 @@ impl Rule for ArbitraryCpiRule {
 
             for cpi_call in cpi_calls {
                 if has_program_validation_before(function, cpi_call.order) {
+                    continue;
+                }
+
+                // The invoked Instruction was built with a compile-time-constant
+                // program ID (system_instruction::*, or a builder handed a
+                // `::id()` / `::ID` path constant). The CPI target cannot be
+                // attacker-supplied — the runtime resolves the program account
+                // by the instruction's own program_id — so there is nothing to
+                // validate.
+                if const_invoke_lines.contains(&cpi_call.span.start_line) {
                     continue;
                 }
 
@@ -137,6 +149,128 @@ fn guard_looks_like_program_allowlist(expression: &str) -> bool {
         || (compact.contains("program") && compact.contains("key()") && compact.contains("=="))
 }
 
+/// Returns the start lines of raw `invoke` / `invoke_signed` calls whose
+/// Instruction argument was built with a compile-time-constant program ID —
+/// either directly inline or through a local `let` binding in the same
+/// function. Two builder shapes qualify:
+///
+/// - `system_instruction::*` — these builders take no program-ID argument
+///   and always target the System Program.
+/// - an `::instruction::` builder given a `::id()` / `::ID` path constant,
+///   e.g. `spl_token::instruction::transfer(&spl_token::id(), ..)`.
+///
+/// `spl_token::instruction::transfer(token_program.key, ..)` does NOT
+/// qualify — an account-supplied key is exactly the arbitrary-CPI risk.
+fn collect_const_program_invoke_lines(file: &syn::File) -> HashSet<usize> {
+    use quote::ToTokens;
+    use syn::spanned::Spanned;
+    use syn::visit::{self, Visit};
+
+    fn compact(tokens: impl ToTokens) -> String {
+        tokens.to_token_stream().to_string().replace(' ', "")
+    }
+
+    /// Strips `&`, parens, and `?` to reach the underlying expression.
+    fn peel(expr: &syn::Expr) -> &syn::Expr {
+        match expr {
+            syn::Expr::Reference(r) => peel(&r.expr),
+            syn::Expr::Paren(p) => peel(&p.expr),
+            syn::Expr::Try(t) => peel(&t.expr),
+            _ => expr,
+        }
+    }
+
+    fn is_const_program_builder(expr: &syn::Expr) -> bool {
+        let syn::Expr::Call(call) = peel(expr) else {
+            return false;
+        };
+        let func = compact(&call.func);
+        if func.contains("system_instruction::") {
+            return true;
+        }
+        if func.contains("::instruction::") {
+            return call.args.iter().any(|arg| {
+                let a = compact(arg);
+                a.contains("::id()") || a.contains("::ID")
+            });
+        }
+        false
+    }
+
+    #[derive(Default)]
+    struct ConstInvokeVisitor {
+        /// Local bindings (per enclosing fn) whose initializer is a
+        /// const-program instruction builder, e.g. `let ix = system_instruction::transfer(..)`.
+        const_bindings: Vec<HashSet<String>>,
+        lines: HashSet<usize>,
+    }
+
+    impl ConstInvokeVisitor {
+        fn arg_is_const_instruction(&self, expr: &syn::Expr) -> bool {
+            let peeled = peel(expr);
+            if is_const_program_builder(peeled) {
+                return true;
+            }
+            if let syn::Expr::Path(p) = peeled {
+                if let Some(name) = p.path.get_ident().map(|i| i.to_string()) {
+                    return self
+                        .const_bindings
+                        .iter()
+                        .any(|scope| scope.contains(&name));
+                }
+            }
+            false
+        }
+    }
+
+    impl<'ast> Visit<'ast> for ConstInvokeVisitor {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            self.const_bindings.push(HashSet::new());
+            visit::visit_item_fn(self, node);
+            self.const_bindings.pop();
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            self.const_bindings.push(HashSet::new());
+            visit::visit_impl_item_fn(self, node);
+            self.const_bindings.pop();
+        }
+
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            if let (Some(init), syn::Pat::Ident(pat)) = (&node.init, &node.pat) {
+                if is_const_program_builder(&init.expr) {
+                    if let Some(scope) = self.const_bindings.last_mut() {
+                        scope.insert(pat.ident.to_string());
+                    }
+                }
+            }
+            visit::visit_local(self, node);
+        }
+
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            let func = compact(&node.func);
+            let is_invoke = func == "invoke"
+                || func == "invoke_signed"
+                || func == "invoke_unchecked"
+                || func.ends_with("::invoke")
+                || func.ends_with("::invoke_signed")
+                || func.ends_with("::invoke_unchecked");
+            if is_invoke {
+                if let Some(first) = node.args.first() {
+                    if self.arg_is_const_instruction(first) {
+                        self.lines.insert(node.span().start().line);
+                    }
+                }
+            }
+            visit::visit_expr_call(self, node);
+        }
+    }
+
+    let mut visitor = ConstInvokeVisitor::default();
+    visitor.visit_file(file);
+    visitor.lines
+}
+
 fn collect_signer_field_names(
     accounts: &crate::anchor_accounts::AnchorAccountsIndex,
 ) -> HashSet<String> {
@@ -178,6 +312,113 @@ mod tests {
                 files: std::slice::from_ref(file),
             },
         )
+    }
+
+    #[test]
+    fn does_not_flag_invoke_of_const_program_builder_binding() {
+        // Native helper shape (as emitted by Anchor->native transpilers, e.g.
+        // Anvil): the Instruction is built with a compile-time-constant
+        // program ID, so the CPI target cannot be attacker-supplied.
+        let file = parse_file(
+            r#"
+            pub fn spl_token_transfer<'a>(
+                from: &AccountInfo<'a>,
+                to: &AccountInfo<'a>,
+                authority: &AccountInfo<'a>,
+                amount: u64,
+            ) -> ProgramResult {
+                let transfer_ix = spl_token::instruction::transfer(
+                    &spl_token::id(),
+                    from.key,
+                    to.key,
+                    authority.key,
+                    &[],
+                    amount,
+                )?;
+                invoke(
+                    &transfer_ix,
+                    &[from.clone(), to.clone(), authority.clone()],
+                )?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_system_instruction_invoke_signed() {
+        // system_instruction builders take no program-ID argument and always
+        // target the System Program.
+        let file = parse_file(
+            r#"
+            pub fn create_program_account<'a>(
+                account: &AccountInfo<'a>,
+                payer: &AccountInfo<'a>,
+                space: u64,
+                program_id: &Pubkey,
+                signer_seeds: &[&[&[u8]]],
+            ) -> ProgramResult {
+                let lamports = Rent::get()?.minimum_balance(space as usize);
+                let create_ix = system_instruction::create_account(
+                    payer.key,
+                    account.key,
+                    lamports,
+                    space,
+                    program_id,
+                );
+                invoke_signed(
+                    &create_ix,
+                    &[payer.clone(), account.clone()],
+                    signer_seeds,
+                )?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_inline_const_builder_invoke() {
+        let file = parse_file(
+            r#"
+            pub fn tip(payer: &AccountInfo, jar: &AccountInfo, amount: u64) -> ProgramResult {
+                invoke(
+                    &system_instruction::transfer(payer.key, jar.key, amount),
+                    &[payer.clone(), jar.clone()],
+                )?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn still_flags_builder_with_account_supplied_program_id() {
+        // An account-supplied key as the builder's program-ID argument is
+        // exactly the arbitrary-CPI risk — the const-builder exemption must
+        // not apply.
+        let file = parse_file(
+            r#"
+            pub fn forward(token_program: &AccountInfo, from: &AccountInfo, to: &AccountInfo, auth: &AccountInfo, amount: u64) -> ProgramResult {
+                let ix = spl_token::instruction::transfer(
+                    token_program.key,
+                    from.key,
+                    to.key,
+                    auth.key,
+                    &[],
+                    amount,
+                )?;
+                invoke(&ix, &[from.clone(), to.clone(), auth.clone()])?;
+                Ok(())
+            }
+            "#,
+        );
+        let findings = run(&file);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "SW003");
     }
 
     #[test]
