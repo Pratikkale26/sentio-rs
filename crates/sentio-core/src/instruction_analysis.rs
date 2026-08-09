@@ -215,10 +215,32 @@ impl FunctionBodyCollector {
                     extract_account_name_from_str(&val)
                 })
                 .collect(),
+            // An array literal enumerates the CPI's accounts explicitly —
+            // native/pinocchio style `invoke(&ix, &[vault, mint_a])` passes
+            // account bindings as bare idents, so an unbound single-segment
+            // path element IS the account name. (A bare non-array arg like
+            // `&accounts` stays opaque — see the Path arm.)
             syn::Expr::Array(a) => a
                 .elems
                 .iter()
-                .flat_map(|e| self.extract_account_names_from_expr(e))
+                .flat_map(|e| {
+                    let names = self.extract_account_names_from_expr(e);
+                    if !names.is_empty() {
+                        return names;
+                    }
+                    let mut inner = e;
+                    while let syn::Expr::Reference(r) = inner {
+                        inner = &r.expr;
+                    }
+                    if let syn::Expr::Path(p) = inner {
+                        if p.path.segments.len() == 1 {
+                            if let Some(seg) = p.path.segments.first() {
+                                return vec![seg.ident.to_string()];
+                            }
+                        }
+                    }
+                    Vec::new()
+                })
                 .collect(),
             syn::Expr::Repeat(r) => self.extract_account_names_from_expr(&r.expr),
             syn::Expr::Call(call) => {
@@ -318,9 +340,29 @@ impl<'ast> Visit<'ast> for FunctionBodyCollector {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         let callee = normalize_tokens(&node.func.to_token_stream().to_string());
         let cpi_account_names = if classify_call_kind(&callee) == CallKind::Cpi {
-            // Merge names from all args (invoke metas array + CpiContext builders).
+            // Raw invoke family: `invoke(&ix, &accounts)` /
+            // `invoke_signed(&ix, &accounts, &signer_seeds)` — only arg 1 is
+            // the accounts list; the trailing signer-seeds array must not
+            // contribute "names". Other CPI shapes (CpiContext builders)
+            // merge from all args.
+            let raw_invoke = {
+                let n = callee.trim();
+                n == "invoke"
+                    || n == "invoke_signed"
+                    || n == "invoke_unchecked"
+                    || n.ends_with("::invoke")
+                    || n.ends_with("::invoke_signed")
+                    || n.ends_with("::invoke_unchecked")
+                    || n.ends_with("::slice_invoke")
+                    || n.ends_with("::slice_invoke_signed")
+            };
+            let args: Vec<&syn::Expr> = if raw_invoke {
+                node.args.iter().nth(1).into_iter().collect()
+            } else {
+                node.args.iter().collect()
+            };
             let mut found = Vec::new();
-            for arg in &node.args {
+            for arg in args {
                 for name in self.extract_account_names_from_expr(arg) {
                     if !found.iter().any(|n| n == &name) {
                         found.push(name);
