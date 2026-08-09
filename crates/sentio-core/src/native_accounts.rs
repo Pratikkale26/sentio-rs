@@ -82,6 +82,11 @@ pub struct NativeAccountBinding {
     /// *only* as a key source (`state.admin = *admin.key`) is a stored
     /// pubkey, not a live authority.
     pub key_reference_count: usize,
+    /// The binding's key feeds a PDA derivation (`find_program_address` /
+    /// `create_program_address` / bump-search helper seeds). Deriving a
+    /// written account from this key makes it a live authority, not a
+    /// stored pubkey.
+    pub used_as_derivation_seed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -191,6 +196,7 @@ impl FileCollector {
             let (refs, key_refs) = count_references(&body_text, &account.name);
             account.reference_count = refs.saturating_sub(1);
             account.key_reference_count = key_refs;
+            account.used_as_derivation_seed = body.seed_sources.contains(&account.name);
         }
 
         let name = sig.ident.to_string();
@@ -265,6 +271,8 @@ struct BodyCollector {
     /// Locals bound to a `find_program_address` / `create_program_address`
     /// result — a key comparison against one of these is a PDA verification.
     derived_vars: std::collections::HashSet<String>,
+    /// Account names whose key feeds a PDA derivation call.
+    seed_sources: std::collections::HashSet<String>,
 }
 
 impl BodyCollector {
@@ -351,6 +359,7 @@ impl<'ast> Visit<'ast> for BodyCollector {
                                 span: span_of(elem.span()),
                                 reference_count: 0,
                                 key_reference_count: 0,
+                                used_as_derivation_seed: false,
                             });
                         }
                     }
@@ -391,6 +400,7 @@ impl<'ast> Visit<'ast> for BodyCollector {
                     span: span_of(node.span()),
                     reference_count: 0,
                     key_reference_count: 0,
+                    used_as_derivation_seed: false,
                 });
             } else if let Some(position) = slice_index_of(&init_text, &self.accounts_param) {
                 self.accounts.push(NativeAccountBinding {
@@ -400,6 +410,7 @@ impl<'ast> Visit<'ast> for BodyCollector {
                     span: span_of(node.span()),
                     reference_count: 0,
                     key_reference_count: 0,
+                    used_as_derivation_seed: false,
                 });
             }
         }
@@ -414,6 +425,22 @@ impl<'ast> Visit<'ast> for BodyCollector {
             self.record_macro(&stmt.mac);
         }
         visit::visit_stmt(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        let callee = compact(&node.func);
+        if callee.contains("program_address") || callee.contains("bump_seed") {
+            for name in self.account_names() {
+                if node
+                    .args
+                    .iter()
+                    .any(|arg| references_account(&compact(arg), &name))
+                {
+                    self.seed_sources.insert(name);
+                }
+            }
+        }
+        visit::visit_expr_call(self, node);
     }
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
@@ -511,6 +538,41 @@ fn count_references(text: &str, name: &str) -> (usize, usize) {
     (refs, key_refs)
 }
 
+/// True when a key comparison pins `name` against something constant — a
+/// `::ID` / `::id()` path or an ALL_CAPS const — rather than a runtime value
+/// like a state field (`state.authority != *authority.key()` is a has_one
+/// relation, not an identity pin, and must not stand in for a signer check).
+fn has_const_pin(text: &str, name: &str) -> bool {
+    let remainder = text
+        .replace(&format!("{name}.key()"), "")
+        .replace(&format!("{name}.key"), "");
+    if remainder.contains("::ID") || remainder.contains("::id()") {
+        return true;
+    }
+    // ALL_CAPS const ident of length >= 3 at identifier boundaries.
+    let bytes = remainder.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+        if start_ok && bytes[i].is_ascii_uppercase() {
+            let mut j = i + 1;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_uppercase() || bytes[j].is_ascii_digit() || bytes[j] == b'_')
+            {
+                j += 1;
+            }
+            let end_ok = j >= bytes.len() || !bytes[j].is_ascii_alphanumeric() && bytes[j] != b'_';
+            if j - i >= 3 && end_ok {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Classifies which checks a condition expression performs on account `name`.
 fn classify_condition(
     text: &str,
@@ -544,7 +606,7 @@ fn classify_condition(
             || derived_vars.iter().any(|v| references_account(text, v));
         if against_derivation {
             kinds.push(NativeCheckKind::PdaDerivation);
-        } else if text.contains("==") || text.contains("!=") {
+        } else if (text.contains("==") || text.contains("!=")) && has_const_pin(text, name) {
             kinds.push(NativeCheckKind::Key);
         }
     }

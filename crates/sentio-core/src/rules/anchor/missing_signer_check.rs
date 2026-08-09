@@ -164,6 +164,7 @@ fn native_findings(file: &ParsedFile) -> Vec<RuleMatch> {
             // `is_pubkey_only` exemption).
             let written = handler.writes.iter().any(|w| w.account == account.name);
             if !written
+                && !account.used_as_derivation_seed
                 && account.reference_count > 0
                 && account.reference_count == account.key_reference_count
             {
@@ -538,6 +539,34 @@ mod tests {
             "#,
         );
         assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn native_flags_has_one_style_compare_without_signer() {
+        // The sealevel-attacks missing-signer shape: authority matched against
+        // stored state and used as a PDA seed, but never signature-checked.
+        // Neither the has_one compare nor the seed use may stand in for
+        // is_signer. (Regression: mutation-derived from Anvil counter output.)
+        let file = parse_file(
+            r#"
+            pub fn increment(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+                let counter = &accounts[0];
+                let authority = &accounts[1];
+                let _bump = bump_seed(program_id, &[b"counter", authority.key().as_ref()], counter.key())?;
+                let counter_account = counter;
+                let mut counter = CounterAccount::from_account_info(counter_account)?;
+                if counter.authority != *authority.key() {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                counter.count += 1;
+                CounterAccount::save(counter_account, &counter)?;
+                Ok(())
+            }
+            "#,
+        );
+        let findings = run(&file);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("`authority`"));
     }
 
     #[test]
