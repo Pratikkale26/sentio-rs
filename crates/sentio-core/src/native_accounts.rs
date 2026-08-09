@@ -502,12 +502,28 @@ impl<'ast> Visit<'ast> for BodyCollector {
         let callee = compact(&node.func);
         if callee.contains("program_address") || callee.contains("bump_seed") {
             for (search, root) in self.search_names() {
-                if node
-                    .args
-                    .iter()
-                    .any(|arg| references_account(&compact(arg), &search))
-                {
-                    self.seed_sources.insert(root);
+                for arg in &node.args {
+                    let text = compact(arg);
+                    if !references_account(&text, &search) {
+                        continue;
+                    }
+                    // A WHOLE argument of `<account>.key()` / `<account>.key`
+                    // is the expected-key operand — the call verifies this
+                    // account's derivation. Nested references (inside seed
+                    // arrays) only mark the account as a seed source.
+                    let peeled = text.trim_start_matches('&');
+                    if peeled == format!("{search}.key()") || peeled == format!("{search}.key") {
+                        let order = self.order();
+                        self.checks.push(NativeCheck {
+                            kind: NativeCheckKind::PdaDerivation,
+                            account: root.clone(),
+                            expression: text.clone(),
+                            span: span_of(arg.span()),
+                            order,
+                        });
+                    } else {
+                        self.seed_sources.insert(root.clone());
+                    }
                 }
             }
         }
