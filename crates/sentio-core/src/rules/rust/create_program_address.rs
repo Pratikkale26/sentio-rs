@@ -30,6 +30,7 @@ impl Rule for CreateProgramAddressRule {
     fn match_file(&self, file: &ParsedFile, _ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
         let mut collector = CreateProgramAddressCollector {
             findings: Vec::new(),
+            canonical_search_depth: 0,
         };
         visit::visit_file(&mut collector, &file.syntax);
 
@@ -57,12 +58,41 @@ impl Rule for CreateProgramAddressRule {
 
 struct CreateProgramAddressCollector {
     findings: Vec<(String, usize, usize)>,
+    /// Depth of enclosing exhaustive descending bump loops (`for b in (0..=255).rev()`).
+    /// Inside such a loop the bump is not caller-supplied — the loop enumerates every
+    /// bump from 255 down, which is what find_program_address does internally, so a
+    /// create_program_address there is a canonical search, not an unchecked derive.
+    canonical_search_depth: usize,
+}
+
+/// Returns true when a for-loop iterator enumerates the full bump space in
+/// descending order: a `.rev()` over a range ending at 255 (inclusive) or 256
+/// (exclusive), e.g. `(0..=255u8).rev()` or `(0..256).rev()`. Descending order
+/// is required — the first match of a 255→0 sweep is the canonical bump, while
+/// an ascending sweep would accept the lowest valid bump, which is not.
+fn is_canonical_bump_iterator(expr: &syn::Expr) -> bool {
+    let compact = expr.to_token_stream().to_string().replace(' ', "");
+    if !compact.contains(".rev()") {
+        return false;
+    }
+    compact.contains("..=255") || compact.contains("..256")
 }
 
 impl<'ast> Visit<'ast> for CreateProgramAddressCollector {
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        let canonical = is_canonical_bump_iterator(&node.expr);
+        if canonical {
+            self.canonical_search_depth += 1;
+        }
+        visit::visit_expr_for_loop(self, node);
+        if canonical {
+            self.canonical_search_depth -= 1;
+        }
+    }
+
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
         let callee = node.func.to_token_stream().to_string().replace(' ', "");
-        if callee.contains("create_program_address") {
+        if callee.contains("create_program_address") && self.canonical_search_depth == 0 {
             let loc = node.span().start();
             self.findings.push((
                 "create_program_address accepts a caller-supplied bump and does not enforce \
@@ -113,6 +143,99 @@ mod tests {
         );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "SW026");
+    }
+
+    #[test]
+    fn does_not_flag_canonical_descending_bump_search() {
+        // Hand-rolled find_program_address: exhaustive 255→0 sweep verified
+        // against an expected key. The bump is loop-enumerated, not
+        // caller-supplied, so the canonical-bump premise of SW026 does not
+        // apply. This shape is emitted by transpilers (e.g. Anvil) and
+        // appears in native programs that avoid the find_program_address
+        // syscall wrapper.
+        let file = parse_file(
+            r#"
+            pub fn bump_seed(
+                program_id: &Pubkey,
+                seeds: &[&[u8]],
+                expected: &Pubkey,
+            ) -> Result<u8, ProgramError> {
+                for bump in (0..=255u8).rev() {
+                    let mut seeds_with_bump: [&[u8]; 16] = [&[]; 16];
+                    let len = seeds.len().min(15);
+                    seeds_with_bump[..len].copy_from_slice(&seeds[..len]);
+                    let bump_slice = &[bump];
+                    seeds_with_bump[len] = bump_slice;
+                    if let Ok(derived) = pinocchio::pubkey::create_program_address(&seeds_with_bump[..len + 1], program_id) {
+                        if &derived == expected {
+                            return Ok(bump);
+                        }
+                    }
+                }
+                Err(ProgramError::InvalidSeeds)
+            }
+            "#,
+        );
+        let rule = CreateProgramAddressRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn still_flags_ascending_bump_loop() {
+        // An ascending sweep accepts the LOWEST valid bump — not canonical —
+        // so the exemption must require .rev().
+        let file = parse_file(
+            r#"
+            pub fn first_valid_bump(program_id: &Pubkey, seeds: &[&[u8]], expected: &Pubkey) -> Option<u8> {
+                for bump in 0..=255u8 {
+                    if let Ok(derived) = Pubkey::create_program_address(&[seeds[0], &[bump]], program_id) {
+                        if &derived == expected {
+                            return Some(bump);
+                        }
+                    }
+                }
+                None
+            }
+            "#,
+        );
+        let rule = CreateProgramAddressRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn still_flags_create_program_address_after_canonical_loop() {
+        // A canonical loop elsewhere in the fn must not exempt a separate
+        // call outside the loop body.
+        let file = parse_file(
+            r#"
+            pub fn mixed(program_id: &Pubkey, seeds: &[&[u8]], expected: &Pubkey, user_bump: u8) -> Option<Pubkey> {
+                for bump in (0..=255u8).rev() {
+                    let _ = Pubkey::create_program_address(&[seeds[0], &[bump]], program_id);
+                }
+                Pubkey::create_program_address(&[seeds[0], &[user_bump]], program_id).ok()
+            }
+            "#,
+        );
+        let rule = CreateProgramAddressRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]
