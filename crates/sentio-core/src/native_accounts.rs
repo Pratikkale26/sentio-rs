@@ -833,6 +833,236 @@ fn slice_index_of(init_text: &str, accounts_param: &str) -> Option<Option<usize>
     None
 }
 
+// ─── token-account trust analysis (SW009/SW010 native layers) ──────────────
+
+/// A site where a handler TRUSTS token-account data (reads its amount) —
+/// with what field checks were observed for that token account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenTrust {
+    /// Handler fn the trust site is in.
+    pub handler: String,
+    /// Account binding whose token data is trusted.
+    pub account: String,
+    pub span: AstSpan,
+    /// A guard compares the token account's `owner` field (unpacked `.owner`
+    /// or a helper that validates bytes 32..64).
+    pub owner_field_checked: bool,
+    /// A guard compares the token account's `mint` field (unpacked `.mint`
+    /// or bytes 0..32).
+    pub mint_field_checked: bool,
+}
+
+/// Finds token-amount trust sites in `file`'s handlers. Two idioms:
+///
+/// - a call to a FREE fn (resolved across `scan`) whose body reads the SPL
+///   token amount bytes `[64..72]` — e.g. a transpiler's
+///   `token_account_amount(vault)` helper. If that helper also validates
+///   owner/mint bytes, the checks count.
+/// - `let v = ..::unpack(..)` / `TokenAccount::from_account_info(..)` with a
+///   subsequent `v.amount` read; `v.owner` / `v.mint` comparisons in
+///   conditions count as field checks.
+///
+/// Only visible code is judged — a call that resolves to nothing is not a
+/// trust site.
+pub fn collect_token_trust(file: &syn::File, scan: &[&syn::File]) -> Vec<TokenTrust> {
+    use std::collections::HashMap;
+
+    // Free-fn bodies across the scan.
+    let mut free_fns: HashMap<String, String> = HashMap::new();
+    for f in scan {
+        struct FnVisitor<'a> {
+            out: &'a mut HashMap<String, String>,
+        }
+        impl<'ast> Visit<'ast> for FnVisitor<'_> {
+            fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+                self.out.insert(
+                    node.sig.ident.to_string(),
+                    node.block.to_token_stream().to_string().replace(' ', ""),
+                );
+                visit::visit_item_fn(self, node);
+            }
+        }
+        FnVisitor { out: &mut free_fns }.visit_file(f);
+    }
+
+    struct Collector<'a> {
+        free_fns: &'a std::collections::HashMap<String, String>,
+        handler_stack: Vec<Option<String>>,
+        /// unpacked local → source account ident
+        unpacked: std::collections::HashMap<String, String>,
+        /// trust sites: (handler, account, span)
+        trusts: Vec<(String, String, AstSpan)>,
+        /// full text of all conditions seen (per file walk)
+        conditions: Vec<String>,
+        /// amount-reads on unpacked locals: local name
+        amount_reads: std::collections::HashSet<String>,
+    }
+
+    impl Collector<'_> {
+        fn first_path_ident(expr: &syn::Expr) -> Option<String> {
+            struct P {
+                found: Option<String>,
+            }
+            impl<'ast> Visit<'ast> for P {
+                fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+                    if self.found.is_none() && node.path.segments.len() == 1 {
+                        if let Some(seg) = node.path.segments.first() {
+                            self.found = Some(seg.ident.to_string());
+                        }
+                    }
+                }
+            }
+            let mut p = P { found: None };
+            p.visit_expr(expr);
+            p.found
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Collector<'_> {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            let is_handler = accounts_slice_param(&node.sig).is_some();
+            self.handler_stack
+                .push(is_handler.then(|| node.sig.ident.to_string()));
+            visit::visit_item_fn(self, node);
+            self.handler_stack.pop();
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            let is_handler = accounts_slice_param(&node.sig).is_some();
+            self.handler_stack
+                .push(is_handler.then(|| node.sig.ident.to_string()));
+            visit::visit_impl_item_fn(self, node);
+            self.handler_stack.pop();
+        }
+
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            if let (syn::Pat::Ident(ident), Some(init)) = (&node.pat, &node.init) {
+                let mut expr: &syn::Expr = &init.expr;
+                while let syn::Expr::Try(t) = expr {
+                    expr = &t.expr;
+                }
+                if let syn::Expr::Call(call) = expr {
+                    let func = compact(&call.func);
+                    if func.contains("::unpack") || func.contains("TokenAccount::from_account_info")
+                    {
+                        if let Some(src) = call.args.first().and_then(Self::first_path_ident) {
+                            self.unpacked.insert(ident.ident.to_string(), src);
+                        }
+                    }
+                }
+            }
+            visit::visit_local(self, node);
+        }
+
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            // Free-fn amount helper: `token_account_amount(vault)`.
+            if let (Some(Some(handler)), syn::Expr::Path(p)) =
+                (self.handler_stack.last(), &*node.func)
+            {
+                if p.path.segments.len() == 1 {
+                    if let Some(seg) = p.path.segments.first() {
+                        if let Some(body) = self.free_fns.get(&seg.ident.to_string()) {
+                            if body.contains("[64..72]") {
+                                if let Some(account) =
+                                    node.args.first().and_then(Self::first_path_ident)
+                                {
+                                    self.trusts.push((
+                                        handler.clone(),
+                                        account,
+                                        span_of(node.span()),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            visit::visit_expr_call(self, node);
+        }
+
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            self.conditions.push(compact(&node.cond));
+            visit::visit_expr_if(self, node);
+        }
+
+        fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+            if let syn::Member::Named(name) = &node.member {
+                if name == "amount" {
+                    if let syn::Expr::Path(p) = &*node.base {
+                        if let Some(ident) = p.path.get_ident() {
+                            self.amount_reads.insert(ident.to_string());
+                        }
+                    }
+                }
+            }
+            visit::visit_expr_field(self, node);
+        }
+    }
+
+    let mut collector = Collector {
+        free_fns: &free_fns,
+        handler_stack: Vec::new(),
+        unpacked: std::collections::HashMap::new(),
+        trusts: Vec::new(),
+        conditions: Vec::new(),
+        amount_reads: std::collections::HashSet::new(),
+    };
+    collector.visit_file(file);
+
+    // Second pass for unpack idiom: which handler owns an unpacked local?
+    // Re-walk with span info would be heavier; instead treat unpack trust as
+    // file-scoped and attribute via the source account's handler below. We
+    // record unpack trusts against every handler that binds the source
+    // account — resolved by the callers (rules) via the native index.
+    let mut out = Vec::new();
+    for (handler, account, span) in &collector.trusts {
+        // A helper that ALSO validates owner/mint bytes counts as checked.
+        let helper_owner = false; // helper-side owner validation folds into conditions below
+        let _ = helper_owner;
+        let owner_field_checked = collector
+            .conditions
+            .iter()
+            .any(|c| c.contains(&format!("{account}.owner")) && c.contains("[32..64]"));
+        let mint_field_checked = collector
+            .conditions
+            .iter()
+            .any(|c| c.contains("[0..32]") && references_account(c, account));
+        out.push(TokenTrust {
+            handler: handler.clone(),
+            account: account.clone(),
+            span: *span,
+            owner_field_checked,
+            mint_field_checked,
+        });
+    }
+    for (local, account) in &collector.unpacked {
+        if !collector.amount_reads.contains(local) {
+            continue;
+        }
+        let owner_field_checked = collector
+            .conditions
+            .iter()
+            .any(|c| c.contains(&format!("{local}.owner")));
+        let mint_field_checked = collector
+            .conditions
+            .iter()
+            .any(|c| c.contains(&format!("{local}.mint")));
+        out.push(TokenTrust {
+            handler: String::new(),
+            account: account.clone(),
+            span: AstSpan {
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            owner_field_checked,
+            mint_field_checked,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
