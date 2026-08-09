@@ -75,6 +75,13 @@ pub struct NativeAccountBinding {
     pub position: Option<usize>,
     pub extraction: NativeExtraction,
     pub span: AstSpan,
+    /// How many times the binding is referenced in the handler body after
+    /// extraction.
+    pub reference_count: usize,
+    /// How many of those references immediately read `.key` — a binding used
+    /// *only* as a key source (`state.admin = *admin.key`) is a stored
+    /// pubkey, not a live authority.
+    pub key_reference_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -174,6 +181,17 @@ impl FileCollector {
             ..BodyCollector::default()
         };
         body.visit_block(block);
+
+        // Reference counting is text-based over the whole body: occurrences
+        // of the binding at identifier boundaries, and how many of those are
+        // immediately followed by `.key`. The binding statement itself
+        // contributes one occurrence — subtracted below.
+        let body_text = compact(block);
+        for account in &mut body.accounts {
+            let (refs, key_refs) = count_references(&body_text, &account.name);
+            account.reference_count = refs.saturating_sub(1);
+            account.key_reference_count = key_refs;
+        }
 
         let name = sig.ident.to_string();
         let qualified_name = {
@@ -331,6 +349,8 @@ impl<'ast> Visit<'ast> for BodyCollector {
                                 position: Some(position),
                                 extraction: NativeExtraction::Destructure,
                                 span: span_of(elem.span()),
+                                reference_count: 0,
+                                key_reference_count: 0,
                             });
                         }
                     }
@@ -369,6 +389,8 @@ impl<'ast> Visit<'ast> for BodyCollector {
                     position: Some(position),
                     extraction: NativeExtraction::NextAccountInfo,
                     span: span_of(node.span()),
+                    reference_count: 0,
+                    key_reference_count: 0,
                 });
             } else if let Some(position) = slice_index_of(&init_text, &self.accounts_param) {
                 self.accounts.push(NativeAccountBinding {
@@ -376,6 +398,8 @@ impl<'ast> Visit<'ast> for BodyCollector {
                     position,
                     extraction: NativeExtraction::Index,
                     span: span_of(node.span()),
+                    reference_count: 0,
+                    key_reference_count: 0,
                 });
             }
         }
@@ -463,6 +487,28 @@ fn references_account(text: &str, name: &str) -> bool {
         }
     }
     false
+}
+
+/// Counts identifier-boundary occurrences of `name` in `text`, and how many
+/// of them are immediately followed by `.key` (field or method access).
+fn count_references(text: &str, name: &str) -> (usize, usize) {
+    let mut refs = 0;
+    let mut key_refs = 0;
+    for (idx, _) in text.match_indices(name) {
+        let before_ok = idx == 0
+            || !text.as_bytes()[idx - 1].is_ascii_alphanumeric()
+                && text.as_bytes()[idx - 1] != b'_';
+        let after = idx + name.len();
+        let after_ok = after >= text.len()
+            || !text.as_bytes()[after].is_ascii_alphanumeric() && text.as_bytes()[after] != b'_';
+        if before_ok && after_ok {
+            refs += 1;
+            if text[after..].starts_with(".key") {
+                key_refs += 1;
+            }
+        }
+    }
+    (refs, key_refs)
 }
 
 /// Classifies which checks a condition expression performs on account `name`.
