@@ -3,6 +3,9 @@ use crate::finding::SourceLocation;
 use crate::instruction_analysis::collect_instruction_index;
 use crate::rules::{Rule, RuleContext, RuleMatch, RuleMetadata, RuleSeverity};
 use crate::syntax::ParsedFile;
+use quote::ToTokens;
+use std::collections::HashSet;
+use syn::visit::{self, Visit};
 
 #[derive(Debug, Default)]
 pub struct MissingCloseConstraintRule;
@@ -27,6 +30,7 @@ impl Rule for MissingCloseConstraintRule {
     fn match_file(&self, file: &ParsedFile, _ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
         let accounts_index = collect_anchor_accounts_index(&file.syntax);
         let instruction_index = collect_instruction_index(&file.syntax);
+        let safe_close_fns = collect_safe_close_fns(&file.syntax);
         let mut findings = Vec::new();
 
         // Check if the file already uses close constraint anywhere — if so, the author is
@@ -45,6 +49,13 @@ impl Rule for MissingCloseConstraintRule {
         // Report once per function (both the drain and the recipient top-up match,
         // but they describe the same closure operation).
         for function in &instruction_index.functions {
+            // A function that pairs the drain with the full safe-close sequence
+            // (reassign to the System Program + shrink data to zero, or a
+            // dedicated close() call) is doing exactly what Anchor's `close`
+            // constraint does under the hood — nothing is left to revive.
+            if safe_close_fns.contains(&function.name) {
+                continue;
+            }
             let drain = function.writes.iter().find(|w| {
                 let t = w.target.to_lowercase();
                 t.contains("lamports") && t.contains("borrow_mut")
@@ -75,6 +86,105 @@ impl Rule for MissingCloseConstraintRule {
 
         findings
     }
+}
+
+/// Collects names of functions whose body performs a SAFE manual close —
+/// the same operations Anchor's `close` constraint performs — so draining
+/// lamports there is not a data-revival risk:
+///
+/// - `.assign(<system program id>)` **and** `.realloc(0, ..)` / `.resize(0)`
+///   (solana_program / pinocchio native style: the account is handed back to
+///   the System Program with zero-length data), or
+/// - a bare `.close()` call (e.g. pinocchio's AccountInfo::close, which
+///   zeroes data length, lamports, and owner in one step).
+fn collect_safe_close_fns(file: &syn::File) -> HashSet<String> {
+    #[derive(Default)]
+    struct FnState {
+        assigns_to_system: bool,
+        shrinks_to_zero: bool,
+        calls_close: bool,
+    }
+
+    #[derive(Default)]
+    struct SafeCloseVisitor {
+        stack: Vec<(String, FnState)>,
+        safe: HashSet<String>,
+    }
+
+    impl SafeCloseVisitor {
+        fn enter(&mut self, name: String) {
+            self.stack.push((name, FnState::default()));
+        }
+
+        fn exit(&mut self) {
+            if let Some((name, state)) = self.stack.pop() {
+                if state.calls_close || (state.assigns_to_system && state.shrinks_to_zero) {
+                    self.safe.insert(name);
+                }
+            }
+        }
+
+        fn record_method_call(&mut self, node: &syn::ExprMethodCall) {
+            let Some((_, state)) = self.stack.last_mut() else {
+                return;
+            };
+            match node.method.to_string().as_str() {
+                "assign" => {
+                    let args = node
+                        .args
+                        .iter()
+                        .map(|a| a.to_token_stream().to_string())
+                        .collect::<String>()
+                        .replace(' ', "")
+                        .to_ascii_lowercase();
+                    if args.contains("system_program") || args.contains("systemprogram") {
+                        state.assigns_to_system = true;
+                    }
+                }
+                "realloc" | "resize" => {
+                    let first_is_zero = node.args.first().is_some_and(|a| {
+                        matches!(
+                            a,
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Int(int),
+                                ..
+                            }) if int.base10_digits() == "0"
+                        )
+                    });
+                    if first_is_zero {
+                        state.shrinks_to_zero = true;
+                    }
+                }
+                "close" if node.args.is_empty() => {
+                    state.calls_close = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for SafeCloseVisitor {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            self.enter(node.sig.ident.to_string());
+            visit::visit_item_fn(self, node);
+            self.exit();
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            self.enter(node.sig.ident.to_string());
+            visit::visit_impl_item_fn(self, node);
+            self.exit();
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            self.record_method_call(node);
+            visit::visit_expr_method_call(self, node);
+        }
+    }
+
+    let mut visitor = SafeCloseVisitor::default();
+    visitor.visit_file(file);
+    visitor.safe
 }
 
 #[cfg(test)]
@@ -156,6 +266,98 @@ mod tests {
             },
         );
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_native_assign_realloc_close() {
+        // solana_program-style safe close: drain + assign(SystemProgram) +
+        // realloc(0). This is byte-for-byte what anchor_lang's close does,
+        // so there is no revival risk. Shape taken from Anchor->native
+        // transpiler output (Anvil).
+        let file = parse_file(
+            r#"
+            pub fn close_program_account<'a>(
+                account: &AccountInfo<'a>,
+                destination: &AccountInfo<'a>,
+            ) -> ProgramResult {
+                if account.key == destination.key {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let lamports = account.lamports();
+                **destination.try_borrow_mut_lamports()? = destination
+                    .lamports()
+                    .checked_add(lamports)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                **account.try_borrow_mut_lamports()? = 0;
+                account.assign(&solana_program::system_program::ID);
+                account.realloc(0, false)?;
+                Ok(())
+            }
+            "#,
+        );
+
+        let rule = MissingCloseConstraintRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_pinocchio_resize_assign_close() {
+        // pinocchio-style safe close: drain + resize(0) + assign(system id).
+        let file = parse_file(
+            r#"
+            pub fn settle_and_close(
+                payer: &AccountInfo,
+                buffer: &AccountInfo,
+            ) -> ProgramResult {
+                *payer.try_borrow_mut_lamports()? += buffer.lamports();
+                *buffer.try_borrow_mut_lamports()? = 0;
+                buffer.resize(0)?;
+                unsafe { buffer.assign(&SYSTEM_PROGRAM_ID) };
+                Ok(())
+            }
+            "#,
+        );
+
+        let rule = MissingCloseConstraintRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn still_flags_drain_with_assign_but_no_shrink() {
+        // assign() alone leaves the data buffer intact at full length until
+        // the tx ends — the incomplete sequence must still flag.
+        let file = parse_file(
+            r#"
+            pub fn drain_only(account: &AccountInfo, destination: &AccountInfo) -> ProgramResult {
+                **destination.try_borrow_mut_lamports()? += account.lamports();
+                **account.try_borrow_mut_lamports()? = 0;
+                account.assign(&solana_program::system_program::ID);
+                Ok(())
+            }
+            "#,
+        );
+
+        let rule = MissingCloseConstraintRule;
+        let findings = rule.match_file(
+            &file,
+            &RuleContext {
+                files: std::slice::from_ref(&file),
+            },
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "SW022");
     }
 
     #[test]
