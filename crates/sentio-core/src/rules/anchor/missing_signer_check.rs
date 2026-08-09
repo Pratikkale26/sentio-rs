@@ -149,6 +149,14 @@ fn native_findings(file: &ParsedFile) -> Vec<RuleMatch> {
                 continue;
             }
 
+            // Forwarded into a CPI: the runtime enforces the signature on the
+            // inner instruction (privilege propagation) — mint authorities
+            // handed to initialize_mint/mint_to etc. Missing is_signer is
+            // defense-in-depth there, not the security boundary.
+            if account.forwarded_to_cpi {
+                continue;
+            }
+
             // Address pin (`x.key == &EXPECTED`) or PDA derivation check —
             // identity is constrained; PDA authorities are seed-signers for
             // CPI, not transaction signers.
@@ -567,6 +575,34 @@ mod tests {
         let findings = run(&file);
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("`authority`"));
+    }
+
+    #[test]
+    fn native_does_not_flag_cpi_forwarded_mint_authority() {
+        // program-examples create-token shape: mint_authority is enforced by
+        // the CPI's own privilege check, not an explicit is_signer.
+        let file = parse_file(
+            r#"
+            pub fn process(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let accounts_iter = &mut accounts.iter();
+                let mint_account = next_account_info(accounts_iter)?;
+                let mint_authority = next_account_info(accounts_iter)?;
+                let payer = next_account_info(accounts_iter)?;
+                invoke(
+                    &token_instruction::initialize_mint(
+                        &spl_token::id(),
+                        mint_account.key,
+                        mint_authority.key,
+                        Some(mint_authority.key),
+                        9,
+                    )?,
+                    &[mint_account.clone(), mint_authority.clone()],
+                )?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
     }
 
     #[test]

@@ -87,6 +87,11 @@ pub struct NativeAccountBinding {
     /// written account from this key makes it a live authority, not a
     /// stored pubkey.
     pub used_as_derivation_seed: bool,
+    /// The binding is forwarded into a CPI (invoke args or an instruction
+    /// builder). For signer-role accounts the runtime enforces the signature
+    /// during the inner instruction (privilege propagation), so an explicit
+    /// is_signer is defense-in-depth rather than the security boundary.
+    pub forwarded_to_cpi: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -197,6 +202,7 @@ impl FileCollector {
             account.reference_count = refs.saturating_sub(1);
             account.key_reference_count = key_refs;
             account.used_as_derivation_seed = body.seed_sources.contains(&account.name);
+            account.forwarded_to_cpi = body.cpi_forwarded.contains(&account.name);
         }
 
         let name = sig.ident.to_string();
@@ -273,6 +279,8 @@ struct BodyCollector {
     derived_vars: std::collections::HashSet<String>,
     /// Account names whose key feeds a PDA derivation call.
     seed_sources: std::collections::HashSet<String>,
+    /// Account names forwarded into CPI calls or instruction builders.
+    cpi_forwarded: std::collections::HashSet<String>,
 }
 
 impl BodyCollector {
@@ -360,6 +368,7 @@ impl<'ast> Visit<'ast> for BodyCollector {
                                 reference_count: 0,
                                 key_reference_count: 0,
                                 used_as_derivation_seed: false,
+                                forwarded_to_cpi: false,
                             });
                         }
                     }
@@ -401,6 +410,7 @@ impl<'ast> Visit<'ast> for BodyCollector {
                     reference_count: 0,
                     key_reference_count: 0,
                     used_as_derivation_seed: false,
+                    forwarded_to_cpi: false,
                 });
             } else if let Some(position) = slice_index_of(&init_text, &self.accounts_param) {
                 self.accounts.push(NativeAccountBinding {
@@ -411,6 +421,7 @@ impl<'ast> Visit<'ast> for BodyCollector {
                     reference_count: 0,
                     key_reference_count: 0,
                     used_as_derivation_seed: false,
+                    forwarded_to_cpi: false,
                 });
             }
         }
@@ -437,6 +448,17 @@ impl<'ast> Visit<'ast> for BodyCollector {
                     .any(|arg| references_account(&compact(arg), &name))
                 {
                     self.seed_sources.insert(name);
+                }
+            }
+        }
+        if callee.contains("invoke") || callee.contains("instruction::") {
+            for name in self.account_names() {
+                if node
+                    .args
+                    .iter()
+                    .any(|arg| references_account(&compact(arg), &name))
+                {
+                    self.cpi_forwarded.insert(name);
                 }
             }
         }
@@ -472,6 +494,19 @@ impl<'ast> Visit<'ast> for BodyCollector {
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        // pinocchio struct CPIs: `Transfer { from, to, .. }.invoke()` /
+        // `.invoke_signed(..)` — accounts referenced by the receiver are
+        // CPI-forwarded.
+        let m = node.method.to_string();
+        if m == "invoke" || m == "invoke_signed" {
+            let recv = compact(&node.receiver);
+            for name in self.account_names() {
+                if references_account(&recv, &name) {
+                    self.cpi_forwarded.insert(name);
+                }
+            }
+        }
+
         // Mutable-borrow methods on an account are writes even without a
         // visible assignment (`x.try_borrow_mut_data()?`, serialize-into).
         let method = node.method.to_string();
