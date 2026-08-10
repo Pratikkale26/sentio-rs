@@ -439,4 +439,4 @@ sentio is under active development. The rule set is growing; the AST infrastruct
   dataset for rule precision, and its transpiled shapes seed the committed mutation
   matrix that guards recall. The same analysis found (and Anvil 0.8.1 fixed) a real
   missing owner/discriminator check in the transpiler's oracle path.
-- The full story of how the two tools debugged each other: *[article — link pending]*.
+- The full story of how the two tools debugged each other: [the article](https://x.com/PratikKale26/status/2086665374859497620).
