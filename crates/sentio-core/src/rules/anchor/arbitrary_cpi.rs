@@ -26,13 +26,14 @@ impl Rule for ArbitraryCpiRule {
         &METADATA
     }
 
-    fn match_file(&self, file: &ParsedFile, _ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
+    fn match_file(&self, file: &ParsedFile, ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
         let index = collect_instruction_index(&file.syntax);
         let accounts = collect_anchor_accounts_index(&file.syntax);
         let signer_fields = collect_signer_field_names(&accounts);
         let mut findings = Vec::new();
 
         let const_invoke_lines = collect_const_program_invoke_lines(&file.syntax);
+        let param_invokes = collect_param_program_invokes(&file.syntax);
 
         for function in &index.functions {
             let cpi_calls: Vec<_> = function
@@ -57,6 +58,22 @@ impl Rule for ArbitraryCpiRule {
                 // by the instruction's own program_id — so there is nothing to
                 // validate.
                 if const_invoke_lines.contains(&cpi_call.span.start_line) {
+                    continue;
+                }
+
+                // Helper-with-validated-callers: the Instruction's program ID
+                // comes from a fn parameter, and EVERY call site of this
+                // helper (across all scanned files) key-validates the account
+                // it passes for that parameter before calling. The check
+                // exists — one function up the call stack. Any unvalidated or
+                // unresolvable call site (or a helper with no visible
+                // callers) keeps the finding.
+                if param_invoke_validated_by_all_callers(
+                    &param_invokes,
+                    &function.name,
+                    cpi_call.span.start_line,
+                    ctx,
+                ) {
                     continue;
                 }
 
@@ -271,6 +288,331 @@ fn collect_const_program_invoke_lines(file: &syn::File) -> HashSet<usize> {
     visitor.lines
 }
 
+/// A raw invoke inside a fn whose Instruction program ID derives from a fn
+/// parameter (`Instruction { program_id: token_metadata_program.key(), .. }`
+/// or an `::instruction::` builder handed `<param>.key`).
+struct ParamProgramInvoke {
+    fn_name: String,
+    param_index: usize,
+    lines: std::collections::HashSet<usize>,
+}
+
+fn collect_param_program_invokes(file: &syn::File) -> Vec<ParamProgramInvoke> {
+    use quote::ToTokens;
+    use syn::spanned::Spanned;
+    use syn::visit::{self, Visit};
+
+    fn compact(tokens: impl ToTokens) -> String {
+        tokens.to_token_stream().to_string().replace(' ', "")
+    }
+
+    fn peel(expr: &syn::Expr) -> &syn::Expr {
+        match expr {
+            syn::Expr::Reference(r) => peel(&r.expr),
+            syn::Expr::Paren(p) => peel(&p.expr),
+            syn::Expr::Try(t) => peel(&t.expr),
+            _ => expr,
+        }
+    }
+
+    fn references_ident(text: &str, name: &str) -> bool {
+        for (idx, _) in text.match_indices(name) {
+            let before_ok = idx == 0
+                || !text.as_bytes()[idx - 1].is_ascii_alphanumeric()
+                    && text.as_bytes()[idx - 1] != b'_';
+            let after = idx + name.len();
+            let after_ok = after >= text.len()
+                || !text.as_bytes()[after].is_ascii_alphanumeric()
+                    && text.as_bytes()[after] != b'_';
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Which fn parameter's `.key` feeds this expression, if any.
+    fn param_key_source(expr: &syn::Expr, params: &[String]) -> Option<usize> {
+        let text = compact(expr);
+        params
+            .iter()
+            .position(|p| references_ident(&text, &format!("{p}.key")))
+    }
+
+    /// Instruction-producing expression whose program ID is a param key:
+    /// `..Instruction { program_id: <param>.key.., .. }` struct literal, or
+    /// an `::instruction::` builder call with a `<param>.key` argument.
+    fn instruction_param_source(expr: &syn::Expr, params: &[String]) -> Option<usize> {
+        match peel(expr) {
+            syn::Expr::Struct(s) => {
+                let path = compact(&s.path);
+                if !path.ends_with("Instruction") {
+                    return None;
+                }
+                s.fields.iter().find_map(|f| {
+                    let is_program_id = matches!(
+                        &f.member,
+                        syn::Member::Named(name) if name == "program_id"
+                    );
+                    if is_program_id {
+                        param_key_source(&f.expr, params)
+                    } else {
+                        None
+                    }
+                })
+            }
+            syn::Expr::Call(call) => {
+                let func = compact(&call.func);
+                if !func.contains("::instruction::") && !func.contains("_instruction::") {
+                    return None;
+                }
+                call.args
+                    .iter()
+                    .find_map(|arg| param_key_source(arg, params))
+            }
+            _ => None,
+        }
+    }
+
+    #[derive(Default)]
+    struct FnState {
+        name: String,
+        params: Vec<String>,
+        /// local binding name -> param index feeding its program id
+        bindings: std::collections::HashMap<String, usize>,
+        /// param index -> invoke lines
+        hits: std::collections::HashMap<usize, std::collections::HashSet<usize>>,
+    }
+
+    #[derive(Default)]
+    struct Collector {
+        stack: Vec<FnState>,
+        out: Vec<ParamProgramInvoke>,
+    }
+
+    impl Collector {
+        fn enter(&mut self, sig: &syn::Signature) {
+            let params = sig
+                .inputs
+                .iter()
+                .map(|input| match input {
+                    syn::FnArg::Typed(t) => match &*t.pat {
+                        syn::Pat::Ident(i) => i.ident.to_string(),
+                        _ => String::new(),
+                    },
+                    syn::FnArg::Receiver(_) => String::new(),
+                })
+                .collect();
+            self.stack.push(FnState {
+                name: sig.ident.to_string(),
+                params,
+                ..FnState::default()
+            });
+        }
+
+        fn exit(&mut self) {
+            if let Some(state) = self.stack.pop() {
+                for (param_index, lines) in state.hits {
+                    self.out.push(ParamProgramInvoke {
+                        fn_name: state.name.clone(),
+                        param_index,
+                        lines,
+                    });
+                }
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Collector {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            self.enter(&node.sig);
+            visit::visit_item_fn(self, node);
+            self.exit();
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            self.enter(&node.sig);
+            visit::visit_impl_item_fn(self, node);
+            self.exit();
+        }
+
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            if let Some(state) = self.stack.last_mut() {
+                if let (syn::Pat::Ident(ident), Some(init)) = (&node.pat, &node.init) {
+                    if let Some(idx) = instruction_param_source(&init.expr, &state.params) {
+                        state.bindings.insert(ident.ident.to_string(), idx);
+                    }
+                }
+            }
+            visit::visit_local(self, node);
+        }
+
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            let func = compact(&node.func);
+            let is_invoke = func == "invoke"
+                || func == "invoke_signed"
+                || func == "invoke_unchecked"
+                || func.ends_with("::invoke")
+                || func.ends_with("::invoke_signed")
+                || func.ends_with("::invoke_unchecked");
+            if is_invoke {
+                if let (Some(state), Some(first)) = (self.stack.last(), node.args.first()) {
+                    let param_index = match peel(first) {
+                        syn::Expr::Path(p) => p
+                            .path
+                            .get_ident()
+                            .and_then(|i| state.bindings.get(&i.to_string()).copied()),
+                        other => instruction_param_source(other, &state.params),
+                    };
+                    if let Some(idx) = param_index {
+                        let line = node.span().start().line;
+                        if let Some(state) = self.stack.last_mut() {
+                            state.hits.entry(idx).or_default().insert(line);
+                        }
+                    }
+                }
+            }
+            visit::visit_expr_call(self, node);
+        }
+    }
+
+    let mut collector = Collector::default();
+    collector.visit_file(file);
+    collector.out
+}
+
+/// True when the finding at `line` in `fn_name` is a param-program invoke AND
+/// every call site of `fn_name` across the scanned files key-validates the
+/// account it passes for that parameter before the call.
+fn param_invoke_validated_by_all_callers(
+    param_invokes: &[ParamProgramInvoke],
+    fn_name: &str,
+    line: usize,
+    ctx: &RuleContext<'_>,
+) -> bool {
+    let Some(invoke) = param_invokes
+        .iter()
+        .find(|p| p.fn_name == fn_name && p.lines.contains(&line))
+    else {
+        return false;
+    };
+
+    let mut call_sites_found = 0usize;
+    for scanned in ctx.files {
+        let caller_index = collect_instruction_index(&scanned.syntax);
+        for site in collect_call_sites(&scanned.syntax, fn_name) {
+            call_sites_found += 1;
+            let Some(arg) = site.args.get(invoke.param_index) else {
+                return false;
+            };
+            // Only a plain identifier argument can be traced to a guard.
+            let arg = arg.trim_start_matches('&');
+            let arg = arg.strip_suffix(".clone()").unwrap_or(arg);
+            if arg.is_empty() || !arg.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return false;
+            }
+            let validated = caller_index
+                .functions
+                .iter()
+                .filter(|f| f.name == site.enclosing_fn)
+                .flat_map(|f| f.guards.iter())
+                .any(|g| {
+                    g.span.start_line < site.line
+                        && g.references_key
+                        && guard_references_ident(&g.expression, arg)
+                });
+            if !validated {
+                return false;
+            }
+        }
+    }
+
+    call_sites_found > 0
+}
+
+fn guard_references_ident(expression: &str, ident: &str) -> bool {
+    let compacted: String = expression.chars().filter(|c| !c.is_whitespace()).collect();
+    for (idx, _) in compacted.match_indices(ident) {
+        let before_ok = idx == 0
+            || !compacted.as_bytes()[idx - 1].is_ascii_alphanumeric()
+                && compacted.as_bytes()[idx - 1] != b'_';
+        let after = idx + ident.len();
+        let after_ok = after >= compacted.len()
+            || !compacted.as_bytes()[after].is_ascii_alphanumeric()
+                && compacted.as_bytes()[after] != b'_';
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+struct CallSite {
+    args: Vec<String>,
+    enclosing_fn: String,
+    line: usize,
+}
+
+/// All plain-path call expressions `callee(..)` matching `callee_name`
+/// (last path segment), with their enclosing fn and argument texts.
+fn collect_call_sites(file: &syn::File, callee_name: &str) -> Vec<CallSite> {
+    use quote::ToTokens;
+    use syn::spanned::Spanned;
+    use syn::visit::{self, Visit};
+
+    struct Collector<'a> {
+        callee_name: &'a str,
+        fn_stack: Vec<String>,
+        out: Vec<CallSite>,
+    }
+
+    impl<'ast> Visit<'ast> for Collector<'_> {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            self.fn_stack.push(node.sig.ident.to_string());
+            visit::visit_item_fn(self, node);
+            self.fn_stack.pop();
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            self.fn_stack.push(node.sig.ident.to_string());
+            visit::visit_impl_item_fn(self, node);
+            self.fn_stack.pop();
+        }
+
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*node.func {
+                let matches_name = p
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == self.callee_name);
+                if matches_name {
+                    if let Some(enclosing) = self.fn_stack.last() {
+                        self.out.push(CallSite {
+                            args: node
+                                .args
+                                .iter()
+                                .map(|a| a.to_token_stream().to_string().replace(' ', ""))
+                                .collect(),
+                            enclosing_fn: enclosing.clone(),
+                            line: node.span().start().line,
+                        });
+                    }
+                }
+            }
+            visit::visit_expr_call(self, node);
+        }
+    }
+
+    let mut collector = Collector {
+        callee_name,
+        fn_stack: Vec::new(),
+        out: Vec::new(),
+    };
+    collector.visit_file(file);
+    collector.out
+}
+
 fn collect_signer_field_names(
     accounts: &crate::anchor_accounts::AnchorAccountsIndex,
 ) -> HashSet<String> {
@@ -419,6 +761,114 @@ mod tests {
         let findings = run(&file);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "SW003");
+    }
+
+    // ─── caller-aware param-program invokes (pinocchio scope) ──────────────
+
+    /// The transpiled-mpl pinocchio shape: helper builds an Instruction whose
+    /// program id is a fn parameter's key, invokes it; the PROCESSOR (other
+    /// file) key-validates the program account before calling the helper.
+    const PINOCCHIO_HELPER: &str = r#"
+        pub fn mpl_approve_collection_authority(
+            collection_authority_record: &AccountInfo,
+            new_collection_authority: &AccountInfo,
+            update_authority: &AccountInfo,
+            token_metadata_program: &AccountInfo,
+            signer_seeds: Option<&[&[&[u8]]]>,
+        ) -> ProgramResult {
+            let metas = [
+                pinocchio::instruction::AccountMeta::new(collection_authority_record.key(), true, false),
+                pinocchio::instruction::AccountMeta::new(new_collection_authority.key(), false, false),
+                pinocchio::instruction::AccountMeta::new(update_authority.key(), true, true),
+            ];
+            let data = [23u8];
+            let ix = pinocchio::instruction::Instruction {
+                program_id: token_metadata_program.key(),
+                accounts: &metas,
+                data: &data,
+            };
+            let infos = [collection_authority_record, new_collection_authority, update_authority];
+            match signer_seeds {
+                Some(_) => pinocchio::cpi::invoke_signed(&ix, &infos, &[]),
+                None => pinocchio::cpi::invoke(&ix, &infos),
+            }
+        }
+    "#;
+
+    fn caller_file(validated: bool) -> String {
+        let guard = if validated {
+            r#"
+                if token_metadata_program.key() != &[11, 112, 101, 177, 227, 209, 124, 69, 56, 157, 82, 127, 107, 4, 195, 205, 88, 184, 108, 115, 26, 160, 253, 181, 73, 182, 209, 188, 3, 248, 41, 70] {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+            "#
+        } else {
+            ""
+        };
+        format!(
+            r#"
+            pub fn approve(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {{
+                let [record, new_authority, update_authority, token_metadata_program] = accounts else {{
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }};
+                {guard}
+                mpl_approve_collection_authority(record, new_authority, update_authority, token_metadata_program, None)?;
+                Ok(())
+            }}
+            "#
+        )
+    }
+
+    fn parse_named(path: &str, source: &str) -> ParsedFile {
+        ParsedFile {
+            path: PathBuf::from(path),
+            source: source.to_string(),
+            syntax: syn::parse_file(source).expect("source should parse"),
+        }
+    }
+
+    #[test]
+    fn exempts_param_program_invoke_when_all_callers_validate_cross_file() {
+        let helper = parse_named("src/helpers.rs", PINOCCHIO_HELPER);
+        let caller = parse_named("src/instructions/approve.rs", &caller_file(true));
+        let files = vec![helper, caller];
+        let findings = ArbitraryCpiRule.match_file(&files[0], &RuleContext { files: &files });
+        assert!(
+            findings.is_empty(),
+            "validated caller must exempt the helper invoke: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn still_flags_param_program_invoke_when_caller_does_not_validate() {
+        let helper = parse_named("src/helpers.rs", PINOCCHIO_HELPER);
+        let caller = parse_named("src/instructions/approve.rs", &caller_file(false));
+        let files = vec![helper, caller];
+        let findings = ArbitraryCpiRule.match_file(&files[0], &RuleContext { files: &files });
+        assert_eq!(findings.len(), 2, "both invoke arms must flag");
+    }
+
+    #[test]
+    fn still_flags_param_program_invoke_with_no_visible_callers() {
+        let helper = parse_named("src/helpers.rs", PINOCCHIO_HELPER);
+        let files = vec![helper];
+        let findings = ArbitraryCpiRule.match_file(&files[0], &RuleContext { files: &files });
+        assert_eq!(findings.len(), 2);
+    }
+
+    #[test]
+    fn still_flags_when_any_caller_is_unvalidated() {
+        let helper = parse_named("src/helpers.rs", PINOCCHIO_HELPER);
+        let good = parse_named("src/instructions/approve.rs", &caller_file(true));
+        let bad_src = caller_file(false).replace("pub fn approve(", "pub fn approve_open(");
+        let bad = parse_named("src/instructions/open.rs", &bad_src);
+        let files = vec![helper, good, bad];
+        let findings = ArbitraryCpiRule.match_file(&files[0], &RuleContext { files: &files });
+        assert_eq!(
+            findings.len(),
+            2,
+            "one unvalidated caller keeps the finding"
+        );
     }
 
     #[test]

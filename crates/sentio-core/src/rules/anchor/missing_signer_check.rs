@@ -1,6 +1,7 @@
 use crate::anchor_accounts::{collect_anchor_accounts_index, AnchorFieldTypeKind};
 use crate::finding::SourceLocation;
 use crate::instruction_analysis::{analyze_account_field_usage, collect_instruction_index};
+use crate::native_accounts::{collect_native_index, NativeCheckKind};
 use crate::rules::{Rule, RuleContext, RuleMatch, RuleMetadata, RuleSeverity};
 use crate::syntax::ParsedFile;
 
@@ -117,8 +118,94 @@ impl Rule for MissingSignerCheckRule {
             }
         }
 
+        findings.extend(native_findings(file));
+
         findings
     }
+}
+
+/// Native / pinocchio layer: the same authority-name heuristic applied to raw
+/// handlers (`fn(.., accounts: &[AccountInfo], ..)`). An authority-named
+/// account binding with no `is_signer` check — and no address pin or PDA
+/// derivation standing in for identity — lets an attacker pass an unsigned
+/// account, exactly like an unchecked `AccountInfo` field in Anchor.
+fn native_findings(file: &ParsedFile) -> Vec<RuleMatch> {
+    let index = collect_native_index(&file.syntax);
+    let mut findings = Vec::new();
+
+    for handler in &index.handlers {
+        for account in &handler.accounts {
+            // Match on the name's head noun (last `_` token): `pool_admin` and
+            // `update_authority` are authorities; `admin_token_a` is a token
+            // account that merely belongs to the admin. The Anchor layer can
+            // afford substring matching because field types filter data
+            // accounts out — native bindings are untyped.
+            let name_lower = account.name.to_lowercase();
+            let head = name_lower.rsplit('_').find(|t| !t.is_empty()).unwrap_or("");
+            let is_authority_named =
+                matches!(head, "authority" | "admin" | "signer" | "initializer");
+            if !is_authority_named {
+                continue;
+            }
+
+            // Explicit is_signer check anywhere in the handler.
+            if handler.has_check(&account.name, NativeCheckKind::Signer) {
+                continue;
+            }
+
+            // Forwarded into a CPI: the runtime enforces the signature on the
+            // inner instruction (privilege propagation) — mint authorities
+            // handed to initialize_mint/mint_to etc. Missing is_signer is
+            // defense-in-depth there, not the security boundary.
+            if account.forwarded_to_cpi {
+                continue;
+            }
+
+            // Address pin (`x.key == &EXPECTED`) or PDA derivation check —
+            // identity is constrained; PDA authorities are seed-signers for
+            // CPI, not transaction signers.
+            if handler.has_check(&account.name, NativeCheckKind::Key)
+                || handler.has_check(&account.name, NativeCheckKind::PdaDerivation)
+            {
+                continue;
+            }
+
+            // Stored-pubkey-only usage (`state.admin = *admin.key()`): every
+            // reference reads `.key` and the account itself is never written —
+            // not a live signer authority (mirrors the Anchor-layer
+            // `is_pubkey_only` exemption).
+            let written = handler.writes.iter().any(|w| w.account == account.name);
+            if !written
+                && !account.used_as_derivation_seed
+                && account.reference_count > 0
+                && account.reference_count == account.key_reference_count
+            {
+                continue;
+            }
+
+            findings.push(RuleMatch {
+                rule_id: "SW001",
+                severity: RuleSeverity::Critical,
+                message: format!(
+                    "Account `{}` in handler `{}` appears to be an authority but is never \
+                     verified with is_signer; an attacker can pass an unsigned account.",
+                    account.name, handler.name
+                ),
+                location: SourceLocation {
+                    path: file.path.display().to_string(),
+                    line: account.span.start_line,
+                    column: 1,
+                },
+                help: Some(
+                    "Add `if !authority.is_signer { return Err(ProgramError::MissingRequiredSignature); }` \
+                     (or `.is_signer()` on pinocchio) before trusting this account."
+                        .to_string(),
+                ),
+            });
+        }
+    }
+
+    findings
 }
 
 #[cfg(test)]
@@ -381,5 +468,158 @@ mod tests {
             findings.is_empty(),
             "stored-pubkey admin must not be SW001: {findings:?}"
         );
+    }
+
+    // ─── native / pinocchio layer ───────────────────────────────────────────
+
+    fn run(file: &ParsedFile) -> Vec<RuleMatch> {
+        MissingSignerCheckRule.match_file(
+            file,
+            &RuleContext {
+                files: std::slice::from_ref(file),
+            },
+        )
+    }
+
+    #[test]
+    fn native_flags_unchecked_admin_in_handler() {
+        let file = parse_file(
+            r#"
+            pub fn process_set_fee(program_id: &Pubkey, accounts: &[AccountInfo], fee: u64) -> ProgramResult {
+                let accounts_iter = &mut accounts.iter();
+                let config = next_account_info(accounts_iter)?;
+                let admin = next_account_info(accounts_iter)?;
+                let mut state = Config::try_from_slice(&config.data.borrow())?;
+                state.fee = fee;
+                state.serialize(&mut &mut config.try_borrow_mut_data()?[..])?;
+                Ok(())
+            }
+            "#,
+        );
+        let findings = run(&file);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("`admin`"));
+    }
+
+    #[test]
+    fn native_does_not_flag_signer_checked_admin() {
+        let file = parse_file(
+            r#"
+            pub fn process_set_fee(program_id: &Pubkey, accounts: &[AccountInfo], fee: u64) -> ProgramResult {
+                let [config, admin] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                if !admin.is_signer() {
+                    return Err(ProgramError::MissingRequiredSignature);
+                }
+                let mut data = config.try_borrow_mut_data()?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn native_does_not_flag_stored_pubkey_only_admin() {
+        // Init-style handler: admin is only recorded, never a live authority.
+        let file = parse_file(
+            r#"
+            pub fn process_initialize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let accounts_iter = &mut accounts.iter();
+                let config = next_account_info(accounts_iter)?;
+                let admin = next_account_info(accounts_iter)?;
+                let state = Config { admin: *admin.key, fee: 0 };
+                state.serialize(&mut &mut config.try_borrow_mut_data()?[..])?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn native_does_not_flag_address_pinned_authority() {
+        let file = parse_file(
+            r#"
+            pub fn process_admin_op(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let [config, admin] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                if admin.key() != &ADMIN_PUBKEY {
+                    return Err(ProgramError::IncorrectAuthority);
+                }
+                let mut data = config.try_borrow_mut_data()?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn native_flags_has_one_style_compare_without_signer() {
+        // The sealevel-attacks missing-signer shape: authority matched against
+        // stored state and used as a PDA seed, but never signature-checked.
+        // Neither the has_one compare nor the seed use may stand in for
+        // is_signer. (Regression: mutation-derived from Anvil counter output.)
+        let file = parse_file(
+            r#"
+            pub fn increment(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+                let counter = &accounts[0];
+                let authority = &accounts[1];
+                let _bump = bump_seed(program_id, &[b"counter", authority.key().as_ref()], counter.key())?;
+                let counter_account = counter;
+                let mut counter = CounterAccount::from_account_info(counter_account)?;
+                if counter.authority != *authority.key() {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                counter.count += 1;
+                CounterAccount::save(counter_account, &counter)?;
+                Ok(())
+            }
+            "#,
+        );
+        let findings = run(&file);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("`authority`"));
+    }
+
+    #[test]
+    fn native_does_not_flag_cpi_forwarded_mint_authority() {
+        // program-examples create-token shape: mint_authority is enforced by
+        // the CPI's own privilege check, not an explicit is_signer.
+        let file = parse_file(
+            r#"
+            pub fn process(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let accounts_iter = &mut accounts.iter();
+                let mint_account = next_account_info(accounts_iter)?;
+                let mint_authority = next_account_info(accounts_iter)?;
+                let payer = next_account_info(accounts_iter)?;
+                invoke(
+                    &token_instruction::initialize_mint(
+                        &spl_token::id(),
+                        mint_account.key,
+                        mint_authority.key,
+                        Some(mint_authority.key),
+                        9,
+                    )?,
+                    &[mint_account.clone(), mint_authority.clone()],
+                )?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
+    }
+
+    #[test]
+    fn native_does_not_flag_non_authority_accounts() {
+        let file = parse_file(
+            r#"
+            pub fn process_read(accounts: &[AccountInfo]) -> ProgramResult {
+                let [counter, system_program] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                let data = counter.try_borrow_mut_data()?;
+                Ok(())
+            }
+            "#,
+        );
+        assert!(run(&file).is_empty());
     }
 }

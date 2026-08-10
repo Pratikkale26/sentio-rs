@@ -4,6 +4,7 @@ pub mod baseline;
 pub mod config;
 pub mod finding;
 pub mod instruction_analysis;
+pub mod native_accounts;
 pub mod registry;
 pub mod rules;
 pub mod sarif;
@@ -24,6 +25,10 @@ pub use finding::{FileLocation, Finding, Severity, SourceLocation};
 pub use instruction_analysis::{
     collect_instruction_index, CallEvidence, CallKind, GuardEvidence, GuardKind,
     InstructionFunction, InstructionIndex, WriteEvidence,
+};
+pub use native_accounts::{
+    collect_native_index, NativeAccountBinding, NativeCheck, NativeCheckKind, NativeExtraction,
+    NativeHandler, NativeIndex, NativeWrite,
 };
 pub use registry::{Rule, RuleCatalog, RuleId};
 pub use rules::{RuleContext, RuleMatch, RuleMetadata, RuleRegistry, RuleSeverity, SuppressionSet};

@@ -2,6 +2,8 @@ use crate::anchor_accounts::{
     collect_anchor_accounts_index, AnchorAccountsField, AnchorFieldTypeKind,
 };
 use crate::finding::SourceLocation;
+use crate::instruction_analysis::collect_instruction_index;
+use crate::native_accounts::{collect_native_index, collect_token_trust, NativeCheckKind};
 use crate::rules::{Rule, RuleContext, RuleMatch, RuleMetadata, RuleSeverity};
 use crate::syntax::ParsedFile;
 
@@ -23,7 +25,7 @@ impl Rule for MissingTokenOwnerCheckRule {
         &METADATA
     }
 
-    fn match_file(&self, file: &ParsedFile, _ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
+    fn match_file(&self, file: &ParsedFile, ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
         let index = collect_anchor_accounts_index(&file.syntax);
         let mut findings = Vec::new();
 
@@ -65,6 +67,8 @@ impl Rule for MissingTokenOwnerCheckRule {
             }
         }
 
+        findings.extend(native_findings(file, ctx));
+
         findings
     }
 }
@@ -74,6 +78,101 @@ fn is_token_account(field: &AnchorAccountsField) -> bool {
         field.type_info.kind,
         AnchorFieldTypeKind::Account | AnchorFieldTypeKind::InterfaceAccount
     ) && field.type_info.display.contains("TokenAccount")
+}
+
+/// Native / pinocchio layer: a handler that TRUSTS a token account's balance
+/// (reads its amount via an spl-layout helper or an unpacked struct) without
+/// either a token-data `owner` field check or an address binding for the
+/// account (key pin / PDA derivation / has_one-shape stored compare) lets an
+/// attacker substitute a token account they control — the fake-vault drain.
+fn native_findings(file: &ParsedFile, ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
+    let scan: Vec<&syn::File> = ctx.files.iter().map(|f| &f.syntax).collect();
+    let trusts = collect_token_trust(&file.syntax, &scan);
+    if trusts.is_empty() {
+        return Vec::new();
+    }
+    let index = collect_native_index(&file.syntax);
+    let instruction_index = collect_instruction_index(&file.syntax);
+    let mut findings = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+    for trust in &trusts {
+        if trust.owner_field_checked {
+            continue;
+        }
+        // Find the handler owning this account binding (trust.handler when
+        // attributed; otherwise any handler that binds the account name).
+        let handler = index
+            .handlers
+            .iter()
+            .find(|h| !trust.handler.is_empty() && h.name == trust.handler)
+            .or_else(|| {
+                index
+                    .handlers
+                    .iter()
+                    .find(|h| h.accounts.iter().any(|a| a.name == trust.account))
+            });
+        let Some(handler) = handler else { continue };
+
+        // Address binding exempts: a pinned/derived/stored vault address
+        // implies both its owner and its mint.
+        let address_bound = handler.has_check(&trust.account, NativeCheckKind::Key)
+            || handler.has_check(&trust.account, NativeCheckKind::PdaDerivation)
+            || instruction_index
+                .functions
+                .iter()
+                .filter(|f| f.name == handler.name)
+                .flat_map(|f| f.guards.iter())
+                .any(|g| {
+                    let c: String = g
+                        .expression
+                        .chars()
+                        .filter(|ch| !ch.is_whitespace())
+                        .collect();
+                    c.contains(".key") && c.contains(&format!("{}.", trust.account))
+                        || c.contains(&format!("{}.key", trust.account))
+                });
+        if address_bound {
+            continue;
+        }
+        if !seen.insert((handler.name.clone(), trust.account.clone())) {
+            continue;
+        }
+
+        let line = if trust.span.start_line > 0 {
+            trust.span.start_line
+        } else {
+            handler
+                .accounts
+                .iter()
+                .find(|a| a.name == trust.account)
+                .map(|a| a.span.start_line)
+                .unwrap_or(handler.span.start_line)
+        };
+
+        findings.push(RuleMatch {
+            rule_id: "SW010",
+            severity: RuleSeverity::Critical,
+            message: format!(
+                "Token account `{}` in handler `{}` has its balance trusted with no owner \
+                 field check and no address binding; an attacker can pass a token account \
+                 they control.",
+                trust.account, handler.name
+            ),
+            location: SourceLocation {
+                path: file.path.display().to_string(),
+                line,
+                column: 1,
+            },
+            help: Some(
+                "Compare the token account's owner field against the expected authority, or \
+                 bind the account's address (stored vault key, PDA derivation, or constant)."
+                    .to_string(),
+            ),
+        });
+    }
+
+    findings
 }
 
 #[cfg(test)]
@@ -255,5 +354,134 @@ mod tests {
             findings.is_empty(),
             "custom .owner == constraints should count: {findings:?}"
         );
+    }
+
+    // ─── native / pinocchio token-trust layer ───────────────────────────────
+
+    fn parse_two(a: (&str, &str), b: (&str, &str)) -> Vec<ParsedFile> {
+        vec![
+            ParsedFile {
+                path: PathBuf::from(a.0),
+                source: a.1.to_string(),
+                syntax: syn::parse_file(a.1).expect("parse a"),
+            },
+            ParsedFile {
+                path: PathBuf::from(b.0),
+                source: b.1.to_string(),
+                syntax: syn::parse_file(b.1).expect("parse b"),
+            },
+        ]
+    }
+
+    const AMOUNT_HELPER: &str = r#"
+        pub fn token_account_amount(account: &AccountInfo) -> Result<u64, ProgramError> {
+            let data = unsafe { account.borrow_data_unchecked() };
+            if data.len() < 72 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            Ok(u64::from_le_bytes(data[64..72].try_into().map_err(|_| ProgramError::InvalidAccountData)?))
+        }
+    "#;
+
+    #[test]
+    fn native_flags_trusted_balance_without_binding() {
+        let handler = r#"
+            pub fn payout(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+                let [vault, recipient, authority] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                if !authority.is_signer() {
+                    return Err(ProgramError::MissingRequiredSignature);
+                }
+                let vault_balance = token_account_amount(vault)?;
+                Ok(())
+            }
+        "#;
+        let files = parse_two(
+            ("src/instructions/payout.rs", handler),
+            ("src/helpers.rs", AMOUNT_HELPER),
+        );
+        let findings =
+            MissingTokenOwnerCheckRule.match_file(&files[0], &RuleContext { files: &files });
+        let native: Vec<_> = findings
+            .iter()
+            .filter(|f| f.message.contains("`vault`"))
+            .collect();
+        assert_eq!(native.len(), 1, "{findings:?}");
+    }
+
+    #[test]
+    fn native_does_not_flag_when_helper_validates_owner_bytes() {
+        // A helper that checks SPL owner bytes [32..64] itself performs the
+        // owner check — callers are covered.
+        let helper = r#"
+            pub fn checked_vault_amount(account: &AccountInfo, expected_owner: &Pubkey) -> Result<u64, ProgramError> {
+                let data = unsafe { account.borrow_data_unchecked() };
+                if data.len() < 72 { return Err(ProgramError::InvalidAccountData); }
+                if &data[32..64] != expected_owner.as_ref() {
+                    return Err(ProgramError::IllegalOwner);
+                }
+                Ok(u64::from_le_bytes(data[64..72].try_into().map_err(|_| ProgramError::InvalidAccountData)?))
+            }
+        "#;
+        let handler = r#"
+            pub fn payout(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let [vault, authority] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                let balance = checked_vault_amount(vault, authority.key())?;
+                Ok(())
+            }
+        "#;
+        let files = parse_two(
+            ("src/instructions/payout.rs", handler),
+            ("src/helpers.rs", helper),
+        );
+        let findings =
+            MissingTokenOwnerCheckRule.match_file(&files[0], &RuleContext { files: &files });
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn native_does_not_flag_address_bound_vault() {
+        let handler = r#"
+            pub fn payout(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+                let [state, vault, authority] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                let s = Config::from_account_info(state)?;
+                if s.vault != *vault.key() {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let vault_balance = token_account_amount(vault)?;
+                Ok(())
+            }
+        "#;
+        let files = parse_two(
+            ("src/instructions/payout.rs", handler),
+            ("src/helpers.rs", AMOUNT_HELPER),
+        );
+        let findings =
+            MissingTokenOwnerCheckRule.match_file(&files[0], &RuleContext { files: &files });
+        assert!(
+            findings.iter().all(|f| !f.message.contains("`vault`")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn native_does_not_flag_unpacked_with_owner_compare() {
+        let handler = r#"
+            pub fn payout(accounts: &[AccountInfo]) -> ProgramResult {
+                let [vault, authority] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                let v = spl_token::state::Account::unpack(&vault.try_borrow_data()?)?;
+                if v.owner != *authority.key {
+                    return Err(ProgramError::IllegalOwner);
+                }
+                let balance = v.amount;
+                Ok(())
+            }
+        "#;
+        let files = parse_two(
+            ("src/instructions/payout.rs", handler),
+            ("src/helpers.rs", AMOUNT_HELPER),
+        );
+        let findings =
+            MissingTokenOwnerCheckRule.match_file(&files[0], &RuleContext { files: &files });
+        assert!(findings.is_empty(), "{findings:?}");
     }
 }
