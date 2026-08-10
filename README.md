@@ -11,9 +11,22 @@
   </p>
 </div>
 
-<p align="center"><strong>Local pre-audit for Anchor programs. No build. No source upload.</strong></p>
+<p align="center"><strong>Local pre-audit for Anchor, native, and pinocchio programs. No build. No source upload.</strong></p>
 
 ---
+
+## Native & pinocchio support
+
+The rules that made Anchor safe by default — signer, owner, discriminator,
+CPI target, PDA identity, token mint/authority — now also run on **raw
+solana-program and pinocchio code**, where nothing is declarative and every
+check is a hand-written statement. Precision was validated against a
+71-program byte-equal transpiler corpus (zero non-parity findings) and recall
+against a committed mutation matrix (`tests/native_mutations.rs`): strip one
+protection, exactly one rule fires. The analysis found a real missing
+owner/discriminator check in a transpiler's emitted oracle path before it hit
+users. Scope and limits — what a clean scan does and does **not** mean — are
+spelled out in [docs/native-rules.md](docs/native-rules.md).
 
 ## 2 steps · 1 minute
 
