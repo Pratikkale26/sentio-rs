@@ -420,4 +420,20 @@ sentio-rs/
 
 sentio is under active development. The rule set is growing; the AST infrastructure is stable.
 
-**22 rules ship today** covering the most common Solana/Anchor vulnerability classes. Native Solana (non-Anchor) rule support is on the roadmap.
+**22 rules ship today** covering the most common Solana/Anchor vulnerability classes — 15 of them (all that apply to raw code) also run on native Solana and pinocchio programs via the native analysis layers ([docs/native-rules.md](docs/native-rules.md)).
+
+## Credits & lineage
+
+- **sentio** is the work of [Prakhar](https://github.com/sentio-security) — the scanner
+  architecture, the Anchor rule catalog, and the CLI come from the upstream project at
+  [sentio-security/sentio-rs](https://github.com/sentio-security/sentio-rs). This repo
+  builds on that foundation; the Anchor-side behavior is intentionally unchanged
+  (78/78 corpus programs scan identically).
+- The **native/pinocchio layers** were built and validated with
+  [Anvil](https://github.com/Pratikkale26/Anvil), a byte-equal Anchor→Pinocchio
+  transpiler by [Pratik](https://github.com/Pratikkale26). Anvil's differential corpus —
+  71 transpiled programs with provably preserved semantics — served as the labeled
+  dataset for rule precision, and its transpiled shapes seed the committed mutation
+  matrix that guards recall. The same analysis found (and Anvil 0.8.1 fixed) a real
+  missing owner/discriminator check in the transpiler's oracle path.
+- The full story of how the two tools debugged each other: *[article — link pending]*.
