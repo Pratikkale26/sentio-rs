@@ -7,7 +7,7 @@
 <div align="center">
   <p>
     <a href="https://crates.io/crates/sentio-core"><img src="https://img.shields.io/crates/v/sentio-core?color=2C1810&label=sentio" alt="sentio version" /></a>
-    <a href="https://github.com/sentio-security/sentio-rs/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/sentio-cli" alt="license" /></a>
+    <a href="https://github.com/Pratikkale26/sentio-native/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/sentio-cli" alt="license" /></a>
   </p>
 </div>
 
@@ -31,11 +31,14 @@ spelled out in [docs/native-rules.md](docs/native-rules.md).
 ## 2 steps · 1 minute
 
 ```bash
-cargo install sentio-cli
+cargo install --git https://github.com/Pratikkale26/sentio-native sentio-cli
 sentio scan .
 ```
 
-That's it. Run from your Anchor workspace root (where `Anchor.toml` lives).
+That's it. Run from your Anchor workspace root (where `Anchor.toml` lives) — or from
+any native/pinocchio program directory; the native analysis layers ship in this repo.
+(`cargo install sentio-cli` from crates.io currently installs the upstream
+Anchor-only build.)
 
 <p align="center">
   <img src="assets/demo.gif" alt="sentio scan demo" width="720" />
@@ -380,7 +383,7 @@ After all rule matches are collected, sentio runs a suppression pass. For each f
 ## Workspace Layout
 
 ```
-sentio-rs/
+sentio-native/
 ├── action/                              # Composite GitHub Action
 ├── examples/github-workflow.yml         # Drop-in CI workflow
 ├── sentio.example.toml                  # Annotated project config
