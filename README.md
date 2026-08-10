@@ -1,442 +1,109 @@
-# sentio
+# anvil-audit
 
-<p align="center">
-  <img src="https://avatars.githubusercontent.com/u/282654001?s=200&v=4" alt="sentio" width="120" />
-</p>
+**Static security analysis for native and pinocchio Solana programs — the
+checks Anchor automates, verified on raw code.**
 
-<div align="center">
-  <p>
-    <a href="https://crates.io/crates/sentio-core"><img src="https://img.shields.io/crates/v/sentio-core?color=2C1810&label=sentio" alt="sentio version" /></a>
-    <a href="https://github.com/Pratikkale26/sentio-native/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/sentio-cli" alt="license" /></a>
-  </p>
-</div>
+Anchor makes a set of safety properties declarative: signer, owner,
+discriminator, CPI target, PDA identity, token mint/authority. Raw
+[solana-program] and [pinocchio] code has no declarative surface — every one of
+those checks is a hand-written statement, and any of them can silently be
+missing. This scanner builds an account-level index of raw handler code and
+runs rule layers over it to detect those missing checks.
 
-<p align="center"><strong>Local pre-audit for Anchor, native, and pinocchio programs. No build. No source upload.</strong></p>
+It powers one concrete, validated workflow: `anvil audit` in
+[Anvil](https://github.com/Pratikkale26/Anvil), which verifies that an
+Anchor→pinocchio transpilation preserved the source program's security posture.
+Use on other codebases is welcome, but experimental — hence the repo name.
+
+[solana-program]: https://docs.rs/solana-program
+[pinocchio]: https://github.com/anza-xyz/pinocchio
 
 ---
 
-## Native & pinocchio support
+## Validation
 
-The rules that made Anchor safe by default — signer, owner, discriminator,
-CPI target, PDA identity, token mint/authority — now also run on **raw
-solana-program and pinocchio code**, where nothing is declarative and every
-check is a hand-written statement. Precision was validated against a
-71-program byte-equal transpiler corpus (zero non-parity findings) and recall
-against a committed mutation matrix (`tests/native_mutations.rs`): strip one
-protection, exactly one rule fires. The analysis found a real missing
-owner/discriminator check in a transpiler's emitted oracle path before it hit
-users. Scope and limits — what a clean scan does and does **not** mean — are
-spelled out in [docs/native-rules.md](docs/native-rules.md).
+The native layers were validated differentially, using byte-equal
+transpilation as ground truth:
 
-## 2 steps · 1 minute
+- **Precision** — measured against 71 programs transpiled from Anchor with
+  byte-equal verification (plus 23 hand-written native `program-examples`
+  programs). Because the transpile provably preserves semantics, any
+  output-only finding is a false positive by construction. End state: **zero
+  non-parity findings** across the corpus, with 155 false positives eliminated
+  along the way.
+- **Recall** — a committed mutation matrix (`tests/native_mutations.rs`):
+  strip one protection from a fixture, exactly the matching rule fires; the
+  fully-checked fixture scans empty.
+- **One real bug found**: a transpiled oracle path read a typed account with
+  no owner or discriminator check where the Anchor original enforced both —
+  caught by the scanner, fixed in `anvil-sol` 0.8.1.
+
+**Scope**: analysis is intra-function and static — a clean scan means the
+checked classes are present, not that the program is audited. Validation to
+date covers the corpus families above; broader real-world hardening is
+ongoing. Full per-rule semantics and known limits:
+[docs/native-rules.md](docs/native-rules.md).
+
+---
+
+## Install & run
 
 ```bash
-cargo install --git https://github.com/Pratikkale26/sentio-native sentio-cli
-sentio scan .
+cargo install --git https://github.com/Pratikkale26/anvil-audit-undertest sentio-cli
+sentio scan ./path/to/program
 ```
 
-That's it. Run from your Anchor workspace root (where `Anchor.toml` lives) — or from
-any native/pinocchio program directory; the native analysis layers ship in this repo.
-(`cargo install sentio-cli` from crates.io currently installs the upstream
-Anchor-only build.)
+> **Naming note:** the crates (`sentio-core`, `sentio-cli`), the binary
+> (`sentio`), the config file (`sentio.toml`), the env var
+> (`SENTIO_NO_TELEMETRY`), and inline suppressions (`// sentio-ignore SWxxx`)
+> carry the names of the upstream project this repo was forked from; a rename
+> pass is pending.
 
-<p align="center">
-  <img src="assets/demo.gif" alt="sentio scan demo" width="720" />
-</p>
-
----
-
-## More commands
+Useful flags:
 
 ```bash
-sentio version
-
-# CI: fail on high/critical, emit SARIF for Code Scanning
-sentio scan . --format sarif --output sentio.sarif --fail-on high
-
-# JSON for tooling / agents
-sentio scan . --format json --output report.json
-
-# Markdown for docs / Discord / Notion
-sentio scan . --format markdown --output report.md
-
-# One rule only
-sentio scan . --rule SW003
-
-sentio rules list
+sentio scan . --format json --output report.json   # machine-readable
+sentio scan . --fail-on high                       # CI gate
+sentio scan . --rule SW003                         # one rule only
+sentio rules list                                  # all rule IDs
 ```
 
-Copy [`sentio.example.toml`](./sentio.example.toml) to `sentio.toml` for excludes, fail thresholds, and per-rule overrides.
-
-**Contribute:** [CONTRIBUTING.md](./CONTRIBUTING.md) — fork → branch → PR.  
-**Limits (ZK, cross-program, AST):** [docs/LIMITATIONS.md](./docs/LIMITATIONS.md).
+Exit codes: `0` clean (or below `--fail-on`), `1` findings at/above threshold,
+`2` parse errors. Scans never make network calls; set `SENTIO_NO_TELEMETRY=1`
+to also silence the version-check ping.
 
 ---
 
-## CLI Reference
+## What it checks
 
-```
-sentio <COMMAND>
+22 rules total; 15 (all that apply to raw code) run on native/pinocchio
+programs via the account-index layers. The native-relevant classes:
 
-Commands:
-  scan      Scan a Solana program directory or file for vulnerabilities
-  rules     Manage and inspect the built-in rule set
-  version   Print the installed sentio version and check for updates
+| Class | Rules |
+| --- | --- |
+| Missing signer check on authority accounts | SW001 |
+| Missing owner / discriminator check on data reads | SW002, SW006 |
+| Arbitrary CPI target | SW003 |
+| Token account owner / mint trust | SW009, SW010 |
+| PDA identity binding (seeds, bump, canonicality) | SW012, SW026 |
+| Post-CPI stale data, unvalidated forwarded accounts | SW008, SW023 |
+| Manual close without full drain | SW022 |
+| Arithmetic / panic hygiene | SW005, SW024, SW025 |
 
-sentio scan [OPTIONS] [PATH]
-
-Arguments:
-  [PATH]                    Directory or .rs file to scan [default: .]
-
-Options:
-  --format <FORMAT>         human (default) | json | sarif | markdown
-  --output <FILE>           Write json/sarif/markdown output to a file
-  --rule <RULE_ID>          Run only a specific rule, e.g. --rule SW003
-  --include-tests           Include test files (excluded by default)
-  --config <FILE>           Path to sentio.toml
-  --fail-on <LEVEL>         off | low | medium | high | critical
-  --baseline <FILE>         Hide findings present in this baseline JSON
-  --update-baseline <FILE>  Write current findings to a baseline file
-  -h, --help                Print help
-
-sentio rules list             Print all rule IDs and titles
-sentio version, -V, --version Print the installed version and check for a newer release
-```
-
-`sentio version` (and `-V`/`--version`) make a brief network call to check for updates. A random anonymous ID is generated on first run and stored at `~/.config/sentio/telemetry_id` so repeated checks from the same machine don't get counted more than once. Set `SENTIO_NO_TELEMETRY=1` to disable this entirely. **No source code, file paths, or scan results ever leave your machine** — `scan` never makes network calls. That is intentional: unlike cloud auto-auditors, sentio is a local pre-audit gate.
-
-**Exit codes**
-
-| Code | Meaning |
-| ---- | ------- |
-| `0`  | Clean, or only findings below `--fail-on` |
-| `1`  | One or more findings at or above `--fail-on` |
-| `2`  | Parse error in one or more files |
+How the account index works, per-rule semantics, and the known-limits list:
+[docs/native-rules.md](docs/native-rules.md).
 
 ---
 
-## Configuration (`sentio.toml`)
-
-Place `sentio.toml` in the scan root (or pass `--config`). CLI flags always override the file.
-
-```toml
-[scan]
-exclude = ["migrations", "idls"]
-include_tests = false
-fail_on = "high"          # recommended for CI
-
-[rules.SW027]
-enabled = false           # hygiene: report locally, don't gate PRs
-
-[rules.SW016]
-severity = "low"          # demote noisy-but-useful rules
-```
-
-See [`sentio.example.toml`](./sentio.example.toml) for a full annotated example.
-
-### Fail thresholds
-
-| `--fail-on` | Exit 1 when… |
-| ----------- | ------------ |
-| `off`       | Never (parse errors still exit 2) |
-| `low`       | Any finding (default, preserves historical CLI behavior) |
-| `medium`    | Medium, high, or critical |
-| `high`      | High or critical (good CI default) |
-| `critical`  | Critical only |
-
-### Baseline (only-new findings)
-
-Adopt sentio without boiling the ocean on day one:
-
-```bash
-# Capture current findings as accepted debt
-sentio scan . --update-baseline .sentio/baseline.json
-
-# Later: only surface regressions
-sentio scan . --baseline .sentio/baseline.json --fail-on high
-```
-
-Baseline identity is `rule_id + path + message` (line numbers are ignored so small refactors do not re-open accepted findings).
-
-### SARIF / GitHub Code Scanning
-
-```bash
-sentio scan . --format sarif --output sentio.sarif --fail-on high
-```
-
-Upload `sentio.sarif` with [`github/codeql-action/upload-sarif`](https://github.com/github/codeql-action). A ready-to-copy workflow lives in [`examples/github-workflow.yml`](./examples/github-workflow.yml). A composite Action is under [`action/`](./action/).
-
----
-
-## Example Output
-
-```
-$ sentio scan ./programs/my-program
-```
-
-```
-==============FINDING 1: SW001 Missing signer check==============
-Severity: critical
-Location: src/instructions/update.rs:14:1
-
-Rule:
-  Detects AccountInfo or UncheckedAccount fields whose names suggest an
-  authority role but have no signer constraint and no is_signer guard.
-
-Matched Because:
-  Account `authority` appears to be an authority but has no signer constraint
-  and no is_signer guard; an attacker can pass an unsigned account.
-
-Source:
-  12|     pub vault: Account<'info, Vault>,
-  13|
- >14|     #[account(mut)]
-    | ^
-  15|     pub authority: AccountInfo<'info>,
-  16|
-
-Guidance:
-  Use Signer<'info> as the field type, add #[account(signer)], or add
-  require!(account.is_signer, ...) in the instruction handler.
-
-==============FINDING 2: SW003 Arbitrary CPI target==============
-Severity: critical
-Location: src/instructions/transfer.rs:29:5
-
-Rule:
-  Detects CPI calls where no key or program ID check precedes the invocation,
-  allowing an attacker to supply a malicious program as the CPI target.
-
-Matched Because:
-  CPI call `invoke` in `handler` has no preceding program key validation.
-
-Source:
-  27|     let ix = build_instruction(&ctx);
-  28|
- >29|     invoke(&ix, &[ctx.accounts.target_program.to_account_info()])?;
-    | ^
-  30|     Ok(())
-  31|
-
-Guidance:
-  Add require!(program.key() == expected::ID, ...) before the CPI, or use
-  Program<'info, T> to enforce program ID validation at the account level.
-
--------- Summary --------
-Total findings: 2
-Critical: 2
-High: 0
-Medium: 0
-Low: 0
-
-By rule:
-  1  SW001 Missing signer check
-  1  SW003 Arbitrary CPI target
-```
-
----
-
-## Rules
-
-Severities follow an audit rubric: **Critical** = direct value loss / compromise with minimal preconditions; **High** = value loss or corruption with one clear precondition; **Medium** = needs chaining; **Low** = hygiene.
-
-| ID | Title | Severity |
-| --- | --- | --- |
-| SW001 | Missing signer check | Critical |
-| SW002 | Missing owner check | Critical |
-| SW003 | Arbitrary CPI target | Critical |
-| SW005 | Unchecked arithmetic | High |
-| SW006 | Type cosplay — missing discriminator check | Critical |
-| SW008 | Missing post-CPI account reload | High |
-| SW009 | Missing token account mint check | High |
-| SW010 | Missing token account owner check | Critical |
-| SW011 | AccountInfo used as data account | High |
-| SW012 | Missing seeds + bump on PDA | High |
-| SW013 | PDA seed references unvalidated account | High |
-| SW014 | PDA bump may not be canonical | High |
-| SW016 | init_if_needed usage (manual review) | High |
-| SW018 | Missing realloc::zero = true | Low |
-| SW020 | AccountInfo used as CPI target program | Critical |
-| SW021 | PDA seed collision risk | High |
-| SW022 | Manual account closure without close constraint | High |
-| SW023 | Unvalidated remaining_accounts forwarded to CPI | Critical |
-| SW024 | Division by zero | High |
-| SW025 | unwrap() / expect() in instruction handler | Medium |
-| SW026 | create_program_address used instead of find_program_address | High |
-| SW027 | Missing event emission on state change | Low |
-
-### Inline Suppressions
-
-Suppress a finding on the same line:
-
-```rust
-#[account(mut)] // sentio-ignore SW001
-pub authority: AccountInfo<'info>,
-```
-
-Suppress a finding on the next line:
-
-```rust
-// sentio-ignore-next-line SW001
-#[account(mut)]
-pub authority: AccountInfo<'info>,
-```
-
-Suppress all findings of a rule within an entire function (useful for intentionally permissionless instructions):
-
-```rust
-// sentio-ignore-fn SW007
-pub fn permissionless_ix(ctx: Context<MyAccounts>) -> Result<()> {
-    // all SW007 findings inside this function are suppressed
-    Ok(())
-}
-```
-
-All forms accept a comma-separated list of rule IDs: `// sentio-ignore SW001, SW002`.
-
----
-
-## How It Works
-
-sentio's precision comes from a two-layer analysis pipeline built on top of `syn`, Rust's macro-safe AST parser. Every rule operates on the actual structure of the code — typed AST nodes, not source text.
-
-### Layer 1 — Anchor Account Index
-
-For every `#[derive(Accounts)]` struct, sentio extracts a typed model of each field:
-
-```
-AccountInfo named "authority"
-  type_info   → kind: AccountInfo, wrappers: []
-  constraints → is_signer: false, owner: false, address: false,
-                init: false, seeds: false, bump: false, ...
-```
-
-This is built by `anchor_accounts.rs`, which uses `syn`'s meta parser to read every key inside `#[account(...)]` into a strongly-typed `AnchorFieldConstraints` struct. Every constraint — `mut`, `signer`, `has_one`, `seeds`, `bump`, `owner`, `address`, `init`, `init_if_needed`, `realloc`, `realloc::zero`, `close` — is parsed from the AST token stream into a typed field on the struct.
-
-### Layer 2 — Instruction Analysis Index
-
-For every function in the file, sentio builds an ordered model of three things:
-
-**Guards** — `if` conditions, `require!`, `assert!` macros. Each guard records which semantic properties it references:
-
-```rust
-require!(ctx.accounts.authority.is_signer, ErrorCode::Unauthorized);
-// → GuardEvidence { references_signer: true, references_key: false, order: 1 }
-```
-
-**Calls** — function and method calls, classified as `Cpi`, `Reload`, `Deserialization`, or `Other`. CPI calls also carry a `cpi_account_names` list — the actual account names resolved from the `CpiContext` struct:
-
-```rust
-let cpi_accounts = Transfer {
-    from: ctx.accounts.vault.to_account_info(),
-    to: ctx.accounts.dest.to_account_info(),
-    authority: ctx.accounts.authority.to_account_info(),
-};
-token::transfer(CpiContext::new(token_prog, cpi_accounts), amount)?;
-// → CallEvidence { kind: Cpi, cpi_account_names: ["vault", "dest", "authority"], order: 3 }
-```
-
-**Writes** — assignment expressions (`=`, `+=`, `-=`, etc.) with the target captured as a string:
-
-```rust
-ctx.accounts.game.status = GameStatus::Resolved;
-// → WriteEvidence { target: "ctx.accounts.game.status", order: 4 }
-```
-
-All three are tagged with a sequential `order` counter so rules can reason about what happened before and after what.
-
-### Cross-Reference Analysis (SW008)
-
-The post-CPI reload rule is the most sophisticated. Without cross-reference tracking, any write after a CPI would produce a finding — including writing `game.status = Resolved` after a token transfer, which is a false positive because `game` wasn't part of the transfer at all.
-
-sentio tracks variable bindings across statements to solve this:
-
-1. `let cpi_accounts = Transfer { from: ctx.accounts.vault, ... }` → sentio records `cpi_accounts → ["vault", "dest", "authority"]` in a binding map.
-2. `let cpi_ctx = CpiContext::new(prog, cpi_accounts)` → sentio resolves `cpi_accounts` through the binding map, forwarding the names to `cpi_ctx`.
-3. `token::transfer(cpi_ctx, amount)` → sentio resolves `cpi_ctx`, giving the call `cpi_account_names: ["vault", "dest", "authority"]`.
-4. After the CPI: `game.status = Resolved` → sentio extracts account name `game`, checks it against `["vault", "dest", "authority"]` → not found → no finding.
-5. After the CPI: `vault.amount -= fee` → sentio extracts `vault` → found → finding.
-
-The inline pattern (`token::transfer(CpiContext::new(prog, Transfer { from: ..., to: ..., authority: ... }), amount)`) is also handled — sentio traverses into the nested call expression to extract the struct fields directly.
-
-### Rule Execution
-
-Each rule receives the `AnchorAccountsIndex` and the `InstructionIndex` for the file and combines them with boolean logic:
-
-```
-SW001: field.type ∈ {AccountInfo, UncheckedAccount}
-       && field.name contains "authority" | "admin" | "signer" | "initializer"
-       && !constraints.is_signer
-       && !constraints.address
-       && no guard references_signer && mentions field_name
-       → flag
-```
-
-No heuristic scoring. No ML. Just structured data and typed predicates.
-
-### Suppression Pass
-
-After all rule matches are collected, sentio runs a suppression pass. For each finding, it looks up the source line and checks whether it contains `// sentio-ignore SWXXX`. Suppressed matches are dropped before results are returned or printed.
-
----
-
-## Workspace Layout
-
-```
-sentio-native/
-├── action/                              # Composite GitHub Action
-├── examples/github-workflow.yml         # Drop-in CI workflow
-├── sentio.example.toml                  # Annotated project config
-├── crates/
-│   ├── sentio-core/
-│   │   ├── src/
-│   │   │   ├── anchor_accounts.rs       # Anchor #[account(...)] constraint parser
-│   │   │   ├── instruction_analysis.rs  # Guard / call / write extractor with CPI cross-reference
-│   │   │   ├── config.rs                # sentio.toml loader + fail-on
-│   │   │   ├── baseline.rs              # Only-new findings baseline
-│   │   │   ├── sarif.rs                 # SARIF 2.1.0 export
-│   │   │   ├── rules/                   # One module per rule
-│   │   │   ├── scanner.rs               # File walker + suppression pass
-│   │   │   └── syntax.rs                # syn parsing wrapper
-│   │   └── tests/
-│   │       ├── fixtures/swXXX/          # risky.rs / safe.rs / suppressed.rs per rule
-│   │       └── rules_swXXX.rs           # Integration test per rule
-│   └── sentio-cli/
-│       └── src/                         # CLI entry point + human formatter
-```
-
----
-
-## Design Philosophy
-
-**Structured analysis.** sentio parses Rust source with `syn` — the same parser used by procedural macros — so every constraint, guard, and expression is a typed AST node. Rules ask "does this field have a `seeds` constraint with no `bump`?" against a structured model, not against source text.
-
-**Anchor-aware.** sentio models Anchor's `#[derive(Accounts)]` structs and their full constraint vocabulary — `signer`, `owner`, `address`, `has_one`, `seeds`, `bump`, `init_if_needed`, `realloc::zero`, and more. It also understands Anchor CPI patterns including `CpiContext::new` and account struct resolution.
-
-**Precision over recall.** A false positive wastes an auditor's time and erodes trust in the tool. Every rule ships with a real-program validation pass. When precision cannot be guaranteed, rules are flagged as `manual review` rather than treated as confirmed vulnerabilities.
-
-**No compiler dependency.** sentio works on raw `.rs` source files. No `rustc_private`, no proc-macro expansion, no `cargo build` needed. Point it at any Solana program directory and it works.
-
----
-
-## Status
-
-sentio is under active development. The rule set is growing; the AST infrastructure is stable.
-
-**22 rules ship today** covering the most common Solana/Anchor vulnerability classes — 15 of them (all that apply to raw code) also run on native Solana and pinocchio programs via the native analysis layers ([docs/native-rules.md](docs/native-rules.md)).
-
-## Credits & lineage
-
-- **sentio** is the work of [Prakhar](https://github.com/sentio-security) — the scanner
-  architecture, the Anchor rule catalog, and the CLI come from the upstream project at
-  [sentio-security/sentio-rs](https://github.com/sentio-security/sentio-rs). This repo
-  builds on that foundation; the Anchor-side behavior is intentionally unchanged
-  (78/78 corpus programs scan identically).
-- The **native/pinocchio layers** were built and validated with
-  [Anvil](https://github.com/Pratikkale26/Anvil), a byte-equal Anchor→Pinocchio
-  transpiler by [Pratik](https://github.com/Pratikkale26). Anvil's differential corpus —
-  71 transpiled programs with provably preserved semantics — served as the labeled
-  dataset for rule precision, and its transpiled shapes seed the committed mutation
-  matrix that guards recall. The same analysis found (and Anvil 0.8.1 fixed) a real
-  missing owner/discriminator check in the transpiler's oracle path.
-- The full story of how the two tools debugged each other: [the article](https://x.com/PratikKale26/status/2086665374859497620).
+## Lineage & license
+
+This repo started as a fork of an upstream open-source Anchor security
+scanner; the Anchor-side rules and CLI architecture come from that project and
+are intentionally unchanged here (78/78 corpus programs scan identically to
+upstream). See [LICENSE](LICENSE) (MIT) for the upstream copyright notice.
+The native/pinocchio layers are new in this repo, built and validated with
+[Anvil](https://github.com/Pratikkale26/Anvil)'s byte-equal differential
+corpus.
+
+The full story of how the two tools debugged each other:
+[the article](https://x.com/PratikKale26/status/2086665374859497620).

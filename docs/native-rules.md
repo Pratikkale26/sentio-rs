@@ -1,6 +1,6 @@
 # Native & Pinocchio rule layers
 
-Sentio's original rules key off Anchor's declarative surface — `#[derive(Accounts)]`
+The upstream scanner's original rules key off Anchor's declarative surface — `#[derive(Accounts)]`
 types and constraints. Raw [solana-program] and [pinocchio] programs have no such
 surface: every safety property is an explicit statement in imperative code. These
 layers recover that analysis for raw programs.
@@ -14,7 +14,7 @@ analysis of arbitrary imperative code is incomplete by nature; a clean scan mean
 
 - **Precision is measured.** Validated against 71 programs transpiled from Anchor
   by [Anvil] with byte-equal verification — because the transpile provably
-  preserves semantics and the Anchor sources scan with sentio's mature rules,
+  preserves semantics and the Anchor sources scan with the upstream scanner's mature Anchor rules,
   any finding on the output that has no counterpart on the input is by
   construction a false positive. End state: **zero non-parity findings** across
   the corpus, plus 23 hand-written `program-examples` native programs.
