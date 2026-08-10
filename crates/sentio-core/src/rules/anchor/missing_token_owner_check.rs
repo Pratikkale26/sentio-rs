@@ -409,6 +409,36 @@ mod tests {
     }
 
     #[test]
+    fn native_does_not_flag_when_helper_validates_owner_bytes() {
+        // A helper that checks SPL owner bytes [32..64] itself performs the
+        // owner check — callers are covered.
+        let helper = r#"
+            pub fn checked_vault_amount(account: &AccountInfo, expected_owner: &Pubkey) -> Result<u64, ProgramError> {
+                let data = unsafe { account.borrow_data_unchecked() };
+                if data.len() < 72 { return Err(ProgramError::InvalidAccountData); }
+                if &data[32..64] != expected_owner.as_ref() {
+                    return Err(ProgramError::IllegalOwner);
+                }
+                Ok(u64::from_le_bytes(data[64..72].try_into().map_err(|_| ProgramError::InvalidAccountData)?))
+            }
+        "#;
+        let handler = r#"
+            pub fn payout(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let [vault, authority] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                let balance = checked_vault_amount(vault, authority.key())?;
+                Ok(())
+            }
+        "#;
+        let files = parse_two(
+            ("src/instructions/payout.rs", handler),
+            ("src/helpers.rs", helper),
+        );
+        let findings =
+            MissingTokenOwnerCheckRule.match_file(&files[0], &RuleContext { files: &files });
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
     fn native_does_not_flag_address_bound_vault() {
         let handler = r#"
             pub fn payout(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {

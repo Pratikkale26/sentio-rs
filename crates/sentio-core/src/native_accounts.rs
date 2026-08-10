@@ -890,8 +890,8 @@ pub fn collect_token_trust(file: &syn::File, scan: &[&syn::File]) -> Vec<TokenTr
         handler_stack: Vec<Option<String>>,
         /// unpacked local → source account ident
         unpacked: std::collections::HashMap<String, String>,
-        /// trust sites: (handler, account, span)
-        trusts: Vec<(String, String, AstSpan)>,
+        /// trust sites: (handler, account, span, helper_checks_owner, helper_checks_mint)
+        trusts: Vec<(String, String, AstSpan, bool, bool)>,
         /// full text of all conditions seen (per file walk)
         conditions: Vec<String>,
         /// amount-reads on unpacked locals: local name
@@ -966,10 +966,15 @@ pub fn collect_token_trust(file: &syn::File, scan: &[&syn::File]) -> Vec<TokenTr
                                 if let Some(account) =
                                     node.args.first().and_then(Self::first_path_ident)
                                 {
+                                    // A helper that also validates the SPL
+                                    // owner (bytes 32..64) or mint (0..32)
+                                    // fields performs the check itself.
                                     self.trusts.push((
                                         handler.clone(),
                                         account,
                                         span_of(node.span()),
+                                        body.contains("[32..64]"),
+                                        body.contains("[0..32]"),
                                     ));
                                 }
                             }
@@ -1015,18 +1020,17 @@ pub fn collect_token_trust(file: &syn::File, scan: &[&syn::File]) -> Vec<TokenTr
     // record unpack trusts against every handler that binds the source
     // account — resolved by the callers (rules) via the native index.
     let mut out = Vec::new();
-    for (handler, account, span) in &collector.trusts {
-        // A helper that ALSO validates owner/mint bytes counts as checked.
-        let helper_owner = false; // helper-side owner validation folds into conditions below
-        let _ = helper_owner;
-        let owner_field_checked = collector
-            .conditions
-            .iter()
-            .any(|c| c.contains(&format!("{account}.owner")) && c.contains("[32..64]"));
-        let mint_field_checked = collector
-            .conditions
-            .iter()
-            .any(|c| c.contains("[0..32]") && references_account(c, account));
+    for (handler, account, span, helper_owner, helper_mint) in &collector.trusts {
+        let owner_field_checked = *helper_owner
+            || collector
+                .conditions
+                .iter()
+                .any(|c| c.contains("[32..64]") && references_account(c, account));
+        let mint_field_checked = *helper_mint
+            || collector
+                .conditions
+                .iter()
+                .any(|c| c.contains("[0..32]") && references_account(c, account));
         out.push(TokenTrust {
             handler: handler.clone(),
             account: account.clone(),
