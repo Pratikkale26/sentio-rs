@@ -28,8 +28,17 @@ impl Rule for DivisionByZeroRule {
         &METADATA
     }
 
-    fn match_file(&self, file: &ParsedFile, _ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
-        let nonzero_consts = collect_nonzero_const_names(&file.syntax);
+    fn match_file(&self, file: &ParsedFile, ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
+        // Collect nonzero consts across the whole project, not just this file:
+        // a divisor is often a `const` defined in another module (e.g. an
+        // orderbook's `SLOT_SIZE` / `ENTRY_SIZE`). Name-based union mirrors the
+        // rule's existing same-file behavior.
+        let mut nonzero_consts = collect_nonzero_const_names(&file.syntax);
+        for other in ctx.files {
+            if !std::ptr::eq(other, file) {
+                collect_nonzero_consts_from_items(&other.syntax.items, &mut nonzero_consts);
+            }
+        }
         let mut collector = DivisionCollector {
             findings: Vec::new(),
             nonzero_consts,
@@ -138,8 +147,23 @@ fn is_safe_divisor(expr: &Expr, nonzero_consts: &HashSet<String>) -> bool {
         Expr::Path(p) => {
             path_last_ident(&p.path).is_some_and(|name| nonzero_consts.contains(&name))
         }
+        // `size_of::<T>()` / `align_of::<T>()` are compile-time constants and
+        // never zero for a real (non-ZST) type — dividing a byte length by an
+        // element size is a ubiquitous, safe idiom (flash-loan `LoanData`,
+        // orderbook slab math). `align_of` is guaranteed >= 1.
+        Expr::Call(call) => is_size_of_call(&call.func),
         _ => false,
     }
+}
+
+/// True for a call to `size_of` / `align_of` (optionally path-qualified as
+/// `mem::size_of` / `core::mem::size_of` / `std::mem::size_of`).
+fn is_size_of_call(func: &Expr) -> bool {
+    if let Expr::Path(p) = func {
+        return path_last_ident(&p.path)
+            .is_some_and(|name| name == "size_of" || name == "align_of");
+    }
+    false
 }
 
 fn path_last_ident(path: &syn::Path) -> Option<String> {
@@ -275,5 +299,46 @@ mod tests {
             }
             "#);
         assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn does_not_flag_size_of_divisor() {
+        // FP from L0STE flash-loan / orderbook slab math.
+        let findings = run(r#"
+            pub fn count(data: &[u8]) -> usize {
+                data.len() / core::mem::size_of::<u64>()
+            }
+            "#);
+        assert!(
+            findings.is_empty(),
+            "size_of divisor must be safe: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_align_of_divisor() {
+        let findings = run(r#"
+            pub fn f(n: usize) -> usize {
+                n % align_of::<u64>()
+            }
+            "#);
+        assert!(
+            findings.is_empty(),
+            "align_of divisor must be safe: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn still_flags_local_variable_divisor() {
+        // TP guardrail: integer_sqrt / bonding-curve shape — divisor is a local
+        // that can reach zero. Must keep firing after the const-fold additions.
+        let findings = run(r#"
+            pub fn isqrt(n: u64) -> u64 {
+                let mut x = n;
+                let y = n / x;
+                y
+            }
+            "#);
+        assert_eq!(findings.len(), 1, "local-variable divisor is a real TP");
     }
 }

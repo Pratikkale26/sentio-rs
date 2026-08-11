@@ -1,14 +1,24 @@
-# Native & Pinocchio rule layers
+# Pinocchio rule layers
 
 The upstream scanner's original rules key off Anchor's declarative surface — `#[derive(Accounts)]`
-types and constraints. Raw [solana-program] and [pinocchio] programs have no such
-surface: every safety property is an explicit statement in imperative code. These
-layers recover that analysis for raw programs.
+types and constraints. Raw [pinocchio] programs have no such surface: every
+safety property is an explicit statement in imperative code. These layers
+recover that analysis for pinocchio programs.
+
+> **Scope note — pinocchio, not native.** The same account index and rules also
+> run on raw [solana-program] (native) code, but native is **not a supported
+> target**. Evaluation on real native programs (including canonical escrow
+> tutorials) showed the analysis over-reports there: native's runtime-ownership
+> enforcement and `spl_token` CPI self-validation are backstops a static AST
+> analysis cannot see, so absent-but-redundant checks read as findings, and
+> Anchor-derived message vocabulary ("close constraint", "discriminator") does
+> not map onto native idioms. Everything below is scoped to pinocchio. Native
+> scanning is experimental and its findings need heavier manual triage.
 
 ## The claim (read this before quoting anything)
 
 **These layers verify that the checks Anchor automates survived being hand-written
-(or transpiled). They do not — and cannot — prove a raw program safe.** Static
+(or transpiled). They do not — and cannot — prove a pinocchio program safe.** Static
 analysis of arbitrary imperative code is incomplete by nature; a clean scan means
 "the checked classes look present," never "audited." What we *can* say precisely:
 
@@ -17,7 +27,7 @@ analysis of arbitrary imperative code is incomplete by nature; a clean scan mean
   preserves semantics and the Anchor sources scan with the upstream scanner's mature Anchor rules,
   any finding on the output that has no counterpart on the input is by
   construction a false positive. End state: **zero non-parity findings** across
-  the corpus, plus 23 hand-written `program-examples` native programs.
+  the corpus, plus 23 hand-written `program-examples` programs.
 - **Recall is measured where it can be.** The committed mutation matrix
   (`tests/fixtures/native/`, driven by `tests/native_mutations.rs`) strips one
   protection per fixture and asserts exactly the matching rule fires — and that
@@ -49,9 +59,9 @@ analysis of arbitrary imperative code is incomplete by nature; a clean scan mean
 Cross-file resolution rides on `RuleContext` (the whole scan), so helper bodies,
 deserializers, and call sites resolve across a project.
 
-## Rule scorecard (raw-code coverage)
+## Rule scorecard (pinocchio coverage)
 
-| Rule | Class | Native/pinocchio behavior |
+| Rule | Class | Pinocchio behavior |
 |---|---|---|
 | SW001 | missing signer | authority-named binding (head noun) never `is_signer`-checked; exempt: const key pin, PDA derivation, stored-pubkey-only use, CPI-forwarded (runtime privilege propagation) |
 | SW002 | missing owner | data read with no owner check, no address pin, no PDA derivation; exempt: created in handler, unresolved externals |

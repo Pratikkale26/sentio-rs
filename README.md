@@ -1,19 +1,27 @@
 # anvil-audit
 
-**Static security analysis for native and pinocchio Solana programs — the
-checks Anchor automates, verified on raw code.**
+**Static security analysis for pinocchio Solana programs — the checks Anchor
+automates, verified on raw code.**
 
 Anchor makes a set of safety properties declarative: signer, owner,
 discriminator, CPI target, PDA identity, token mint/authority. Raw
-[solana-program] and [pinocchio] code has no declarative surface — every one of
-those checks is a hand-written statement, and any of them can silently be
-missing. This scanner builds an account-level index of raw handler code and
-runs rule layers over it to detect those missing checks.
+[pinocchio] code has no declarative surface — every one of those checks is a
+hand-written statement, and any of them can silently be missing. This scanner
+builds an account-level index of raw handler code and runs rule layers over it
+to detect those missing checks.
 
 It powers one concrete, validated workflow: `anvil audit` in
 [Anvil](https://github.com/Pratikkale26/Anvil), which verifies that an
 Anchor→pinocchio transpilation preserved the source program's security posture.
-Use on other codebases is welcome, but experimental — hence the repo name.
+Use on other pinocchio codebases is welcome, but experimental — hence the repo
+name.
+
+> **Scope: pinocchio.** The same rules technically run on raw
+> [solana-program] (native) code, but native is **not a supported target** —
+> evaluation on real native programs showed the analysis is materially noisier
+> there (native's runtime-ownership and `spl_token` CPI backstops are invisible
+> to static analysis, so the rules over-report). Treat native scanning as
+> experimental only. The claims below are for pinocchio.
 
 [solana-program]: https://docs.rs/solana-program
 [pinocchio]: https://github.com/anza-xyz/pinocchio
@@ -22,7 +30,7 @@ Use on other codebases is welcome, but experimental — hence the repo name.
 
 ## Validation
 
-The native layers were validated differentially, using byte-equal
+The pinocchio rule layers were validated differentially, using byte-equal
 transpilation as ground truth:
 
 - **Precision** — measured against 71 programs transpiled from Anchor with

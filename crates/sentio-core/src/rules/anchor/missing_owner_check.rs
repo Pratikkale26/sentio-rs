@@ -4,6 +4,7 @@ use crate::instruction_analysis::{analyze_account_field_usage, collect_instructi
 use crate::native_accounts::{collect_native_index, NativeCheckKind};
 use crate::rules::{Rule, RuleContext, RuleMatch, RuleMetadata, RuleSeverity};
 use crate::syntax::ParsedFile;
+use quote::ToTokens;
 
 #[derive(Debug, Default)]
 pub struct MissingOwnerCheckRule;
@@ -20,7 +21,7 @@ impl Rule for MissingOwnerCheckRule {
         &METADATA
     }
 
-    fn match_file(&self, file: &ParsedFile, _ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
+    fn match_file(&self, file: &ParsedFile, ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
         let accounts_index = collect_anchor_accounts_index(&file.syntax);
         let instruction_index = collect_instruction_index(&file.syntax);
         let mut findings = Vec::new();
@@ -101,7 +102,7 @@ impl Rule for MissingOwnerCheckRule {
             }
         }
 
-        findings.extend(native_findings(file));
+        findings.extend(native_findings(file, ctx));
 
         findings
     }
@@ -112,8 +113,18 @@ impl Rule for MissingOwnerCheckRule {
 /// without an address pin lets an attacker pass a lookalike account owned by
 /// any program — the same trust gap as an unchecked `AccountInfo` field in
 /// Anchor.
-fn native_findings(file: &ParsedFile) -> Vec<RuleMatch> {
+fn native_findings(file: &ParsedFile, ctx: &RuleContext<'_>) -> Vec<RuleMatch> {
     let index = collect_native_index(&file.syntax);
+    // Cross-file resolution: an owner check often lives in a helper the handler
+    // calls (`check_account_owner(acc)`), or inside a token library's
+    // `TokenAccount::from_account_info` (which runs `is_owned_by` internally).
+    // Per-file analysis misses both, producing false positives on well-guarded
+    // programs (p-token, orderbook). We credit an account as owner-established
+    // only when it flows into a helper whose body ACTUALLY compares `.owner`,
+    // so a hand-rolled loader that skips the owner check (the liquid-staking
+    // vulnerability class) still fires.
+    let owner_checking_fns = collect_owner_checking_fn_names(ctx);
+    let established = accounts_owner_established(&file.syntax, &owner_checking_fns);
     let mut findings = Vec::new();
 
     for handler in &index.handlers {
@@ -135,6 +146,11 @@ fn native_findings(file: &ParsedFile) -> Vec<RuleMatch> {
                 || handler.has_check(&account.name, NativeCheckKind::Key)
                 || handler.has_check(&account.name, NativeCheckKind::PdaDerivation)
             {
+                continue;
+            }
+
+            // Owner established by a cross-file helper or a token-library loader.
+            if established.contains(&account.name) {
                 continue;
             }
 
@@ -167,6 +183,115 @@ fn native_findings(file: &ParsedFile) -> Vec<RuleMatch> {
     }
 
     findings
+}
+
+/// Token-library types whose `from_account_info` verifies program ownership
+/// internally (`is_owned_by(&token_program::ID)`). Keyed by receiver TYPE so a
+/// project's own `AccountData::from_account_info` — which may skip the owner
+/// check — is judged by its body instead (see [`collect_owner_checking_fn_names`]).
+const OWNER_CHECKING_LIB_TYPES: &[&str] = &["TokenAccount", "Mint", "TokenAccount2022", "Mint2022"];
+
+/// Names of project functions whose body performs an owner comparison on one
+/// of their parameters (`x.is_owned_by(..)` or `x.owner … != / ==`). These are
+/// the hand-rolled `check_account_owner` / `validate_owner` helpers; calling
+/// one with an account establishes that account's ownership.
+fn collect_owner_checking_fn_names(ctx: &RuleContext<'_>) -> std::collections::HashSet<String> {
+    use syn::visit::{self, Visit};
+
+    fn body_checks_owner(block: &syn::Block) -> bool {
+        let t = block.to_token_stream().to_string();
+        let compact = t.replace(' ', "");
+        compact.contains(".is_owned_by(")
+            || (compact.contains(".owner") && (compact.contains("!=") || compact.contains("==")))
+    }
+
+    #[derive(Default)]
+    struct FnVisitor {
+        names: std::collections::HashSet<String>,
+    }
+    impl<'ast> Visit<'ast> for FnVisitor {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            if body_checks_owner(&node.block) {
+                self.names.insert(node.sig.ident.to_string());
+            }
+            visit::visit_item_fn(self, node);
+        }
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            if body_checks_owner(&node.block) {
+                self.names.insert(node.sig.ident.to_string());
+            }
+            visit::visit_impl_item_fn(self, node);
+        }
+    }
+
+    let mut v = FnVisitor::default();
+    for f in ctx.files {
+        v.visit_file(&f.syntax);
+    }
+    v.names
+}
+
+/// Account names in `file` that flow into an owner-establishing call — a
+/// token-library `TokenAccount::from_account_info`, or a project helper from
+/// [`collect_owner_checking_fn_names`].
+fn accounts_owner_established(
+    file: &syn::File,
+    owner_checking_fns: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    use syn::visit::{self, Visit};
+
+    /// Leading account identifier of a call argument (`&acc`, `*acc`,
+    /// `acc.clone()`, `acc.key` all resolve to `acc`).
+    fn arg_root_ident(expr: &syn::Expr) -> Option<String> {
+        match expr {
+            syn::Expr::Reference(r) => arg_root_ident(&r.expr),
+            syn::Expr::Unary(u) => arg_root_ident(&u.expr),
+            syn::Expr::Paren(p) => arg_root_ident(&p.expr),
+            syn::Expr::Group(g) => arg_root_ident(&g.expr),
+            syn::Expr::MethodCall(m) => arg_root_ident(&m.receiver),
+            syn::Expr::Field(f) => arg_root_ident(&f.base),
+            syn::Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
+            _ => None,
+        }
+    }
+
+    struct CallVisitor<'a> {
+        fns: &'a std::collections::HashSet<String>,
+        established: std::collections::HashSet<String>,
+    }
+    impl<'ast> Visit<'ast> for CallVisitor<'_> {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*node.func {
+                let segs: Vec<String> = p
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                if let Some(last) = segs.last() {
+                    let is_lib = last == "from_account_info"
+                        && segs.len() >= 2
+                        && OWNER_CHECKING_LIB_TYPES.contains(&segs[segs.len() - 2].as_str());
+                    let is_project = self.fns.contains(last);
+                    if is_lib || is_project {
+                        for arg in &node.args {
+                            if let Some(id) = arg_root_ident(arg) {
+                                self.established.insert(id);
+                            }
+                        }
+                    }
+                }
+            }
+            visit::visit_expr_call(self, node);
+        }
+    }
+
+    let mut v = CallVisitor {
+        fns: owner_checking_fns,
+        established: std::collections::HashSet::new(),
+    };
+    v.visit_file(file);
+    v.established
 }
 
 #[cfg(test)]
@@ -650,5 +775,95 @@ mod tests {
             "#,
         );
         assert!(run(&file).is_empty());
+    }
+
+    fn run_multi(files: &[ParsedFile]) -> Vec<RuleMatch> {
+        MissingOwnerCheckRule.match_file(&files[0], &RuleContext { files })
+    }
+
+    #[test]
+    fn native_credits_cross_file_owner_helper() {
+        // p-token / orderbook shape: the owner check lives in a helper defined
+        // in another file. Per-file analysis missed it → false positive. The
+        // account passed to `check_account_owner` must be credited.
+        let handler = ParsedFile {
+            path: PathBuf::from("src/processor/transfer.rs"),
+            source: String::new(),
+            syntax: syn::parse_file(
+                r#"
+                pub fn process_transfer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                    let [source] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                    check_account_owner(source)?;
+                    let acc = SourceState::from_account_info(source)?;
+                    Ok(())
+                }
+                "#,
+            )
+            .unwrap(),
+        };
+        let helper = ParsedFile {
+            path: PathBuf::from("src/processor/mod.rs"),
+            source: String::new(),
+            syntax: syn::parse_file(
+                r#"
+                fn check_account_owner(account_info: &AccountInfo) -> ProgramResult {
+                    if &TOKEN_PROGRAM_ID != account_info.owner() {
+                        return Err(ProgramError::IncorrectProgramId);
+                    }
+                    Ok(())
+                }
+                "#,
+            )
+            .unwrap(),
+        };
+        let files = vec![handler, helper];
+        assert!(run_multi(&files).is_empty(), "{:?}", run_multi(&files));
+    }
+
+    #[test]
+    fn native_still_flags_length_only_helper() {
+        // TP guard (liquid-staking class): the helper checks LENGTH only, never
+        // ownership — the account must still be flagged even though it flows
+        // through a `from_account_info`-shaped loader.
+        let handler = ParsedFile {
+            path: PathBuf::from("src/instructions/withdraw.rs"),
+            source: String::new(),
+            syntax: syn::parse_file(
+                r#"
+                pub fn process_withdraw(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                    let [pool] = accounts else { return Err(ProgramError::NotEnoughAccountKeys); };
+                    let state = StakingPool::from_account_info(pool)?;
+                    Ok(())
+                }
+                "#,
+            )
+            .unwrap(),
+        };
+        let helper = ParsedFile {
+            path: PathBuf::from("src/states/helper.rs"),
+            source: String::new(),
+            syntax: syn::parse_file(
+                r#"
+                impl StakingPool {
+                    pub fn from_account_info(account: &AccountInfo) -> Result<Self, ProgramError> {
+                        let data = unsafe { account.borrow_data_unchecked() };
+                        if data.len() != Self::LEN {
+                            return Err(ProgramError::InvalidAccountData);
+                        }
+                        Ok(Self::read(&data))
+                    }
+                }
+                "#,
+            )
+            .unwrap(),
+        };
+        let files = vec![handler, helper];
+        let findings = run_multi(&files);
+        assert_eq!(
+            findings.len(),
+            1,
+            "length-only loader is not an owner check: {findings:?}"
+        );
+        assert!(findings[0].message.contains("`pool`"));
     }
 }

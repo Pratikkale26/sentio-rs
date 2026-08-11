@@ -197,21 +197,58 @@ fn collect_const_program_invoke_lines(file: &syn::File) -> HashSet<usize> {
         }
     }
 
-    fn is_const_program_builder(expr: &syn::Expr) -> bool {
-        let syn::Expr::Call(call) = peel(expr) else {
-            return false;
-        };
-        let func = compact(&call.func);
-        if func.contains("system_instruction::") {
+    /// A CPI target program id that is fixed at compile time, so an attacker
+    /// cannot substitute the CPI target: `crate::ID` / `spl_token::ID` / any
+    /// `::ID` or `::id()` path, or an ALL_CAPS const (e.g. `RAYDIUM_CPMM_ID`).
+    fn is_const_program_id_value(expr: &syn::Expr) -> bool {
+        let peeled = peel(expr);
+        let s = compact(peeled);
+        if s.contains("::ID") || s.contains("::id()") {
             return true;
         }
-        if func.contains("::instruction::") {
-            return call.args.iter().any(|arg| {
-                let a = compact(arg);
-                a.contains("::id()") || a.contains("::ID")
-            });
+        if let syn::Expr::Path(p) = peeled {
+            if let Some(last) = p.path.segments.last() {
+                let name = last.ident.to_string();
+                return name.len() >= 2
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    && name.chars().any(|c| c.is_ascii_uppercase());
+            }
         }
         false
+    }
+
+    fn is_const_program_builder(expr: &syn::Expr) -> bool {
+        match peel(expr) {
+            // Struct literal `Instruction { program_id: <const>, .. }` — the
+            // pinocchio idiom for building a CPI. If program_id is a compile-time
+            // constant, the CPI target is fixed (Raydium/SPL SDK wrappers).
+            syn::Expr::Struct(s) => {
+                let path = compact(&s.path);
+                (path == "Instruction" || path.ends_with("::Instruction"))
+                    && s.fields.iter().any(|f| {
+                        matches!(&f.member, syn::Member::Named(n) if n == "program_id")
+                            && is_const_program_id_value(&f.expr)
+                    })
+            }
+            // Call-based builders: `system_instruction::transfer(..)` or an
+            // `::instruction::` builder handed a `::id()` / `::ID` constant.
+            syn::Expr::Call(call) => {
+                let func = compact(&call.func);
+                if func.contains("system_instruction::") {
+                    return true;
+                }
+                if func.contains("::instruction::") {
+                    return call.args.iter().any(|arg| {
+                        let a = compact(arg);
+                        a.contains("::id()") || a.contains("::ID")
+                    });
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     #[derive(Default)]

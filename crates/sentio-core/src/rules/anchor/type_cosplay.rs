@@ -169,7 +169,18 @@ fn native_deserializer_findings(
                 if segs.len() >= 2 {
                     let method = segs[segs.len() - 1].clone();
                     let ty = segs[segs.len() - 2].clone();
-                    if DESERIALIZER_METHODS.contains(&method.as_str()) && ty != "Self" {
+                    // Skip deserialization of INSTRUCTION data — type cosplay is
+                    // about substituting an ACCOUNT of a confusable type. Parsing
+                    // the instruction byte buffer (`Ix::try_from_bytes(instruction_data)`)
+                    // or a type that is itself an instruction (`EscrowInstruction`,
+                    // `VoteIxData`) has no account-substitution surface.
+                    let deserializes_instruction_data =
+                        node.args.first().is_some_and(arg_is_instruction_data)
+                            || type_is_instruction(&ty);
+                    if DESERIALIZER_METHODS.contains(&method.as_str())
+                        && ty != "Self"
+                        && !deserializes_instruction_data
+                    {
                         if let Some(false) = self.safe.get(&(ty.clone(), method.clone())) {
                             let loc = node.func.span().start();
                             self.findings.push((
@@ -195,6 +206,40 @@ fn native_deserializer_findings(
     };
     visitor.visit_file(&file.syntax);
     visitor.findings
+}
+
+/// True when a deserializer argument is the instruction byte buffer rather
+/// than account data (`instruction_data`, `ix_data`, `input`, or a slice of
+/// one). Account-data args (`&acc.data`, `account_data`) are not matched.
+fn arg_is_instruction_data(expr: &syn::Expr) -> bool {
+    use quote::ToTokens;
+    let s = expr.to_token_stream().to_string().replace(' ', "");
+    let base = s.trim_start_matches('&').trim_start_matches('*');
+    // Bare identifier, or a slice/subslice of it: `instruction_data[8..]`.
+    let head = base
+        .split(['[', '.'])
+        .next()
+        .unwrap_or(base)
+        .trim_start_matches('&');
+    matches!(
+        head,
+        "instruction_data"
+            | "_instruction_data"
+            | "ix_data"
+            | "_ix_data"
+            | "instruction_bytes"
+            | "ix_bytes"
+            | "input"
+    )
+}
+
+/// True when a type name denotes an instruction (its args), not a stored
+/// account — e.g. `EscrowInstruction`, `VoteIxData`, `InitializeMintInstructionData`.
+fn type_is_instruction(ty: &str) -> bool {
+    ty.ends_with("Instruction")
+        || ty.ends_with("InstructionData")
+        || ty.ends_with("IxData")
+        || ty.ends_with("IxArgs")
 }
 
 fn collect_impl_fn_bodies(
@@ -423,6 +468,29 @@ mod tests {
         let files = vec![handler, state];
         let findings = TypeCosplayRule.match_file(&files[0], &RuleContext { files: &files });
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn native_does_not_flag_instruction_data_deserialization() {
+        // FP class: parsing the instruction byte buffer is not account type
+        // cosplay. Both the arg-name signal (`instruction_data`) and the
+        // type-name signal (`*Instruction`) must suppress.
+        let handler = parse_named(
+            "src/processor.rs",
+            r#"
+            pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+                let ix = EscrowInstruction::unpack(instruction_data)?;
+                let args = InitializeMint::try_from_bytes(instruction_data)?;
+                Ok(())
+            }
+            "#,
+        );
+        let files = vec![handler];
+        let findings = TypeCosplayRule.match_file(&files[0], &RuleContext { files: &files });
+        assert!(
+            findings.is_empty(),
+            "instruction-data deser must not flag: {findings:?}"
+        );
     }
 
     #[test]
